@@ -233,7 +233,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 max_bs=max(server_args.cuda_graph_config.decode.bs),
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
                 device=self.device,
-                tp_sync=self._tp_sync,
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
