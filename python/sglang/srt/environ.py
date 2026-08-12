@@ -489,6 +489,18 @@ class Envs:
     # umbrella ceiling that bites when Knob A or the base chunk lets a
     # single rank take more than a small slice of it).
     SGLANG_CROSS_RANK_PREFILL_BUDGET = EnvInt(0)
+    # Session inventory for radixrehome (OUR patch; see
+    # managers/session_inventory.py). When set to a non-empty path the
+    # tokenizer manager upserts registry.json + sessions/<id>.ids.json
+    # after each finished keyed generate request so the radixrehome
+    # sidecar has migration candidates. Empty/unset = disabled (default
+    # off in generic builds; sage compose sets
+    # /var/lib/radixrehome). MAX_ENTRIES is an LRU cap on registry size;
+    # MAX_TOKENS skips inventory for prompts above the ceiling (prefer
+    # skip over dumping 1M-token ids every turn).
+    SGLANG_SESSION_INVENTORY_DIR = EnvStr("")
+    SGLANG_SESSION_INVENTORY_MAX_ENTRIES = EnvInt(4096)
+    SGLANG_SESSION_INVENTORY_MAX_TOKENS = EnvInt(524288)
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
     SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)

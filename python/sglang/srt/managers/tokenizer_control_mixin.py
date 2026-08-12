@@ -35,6 +35,8 @@ from sglang.srt.managers.io_struct import (
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
+    ParkSessionReqInput,
+    ParkSessionReqOutput,
     GetWeightsByNameReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
@@ -107,6 +109,7 @@ _COMMUNICATOR_SPECS = [
     ("check_weights", CheckWeightsReqOutput),
     ("slow_down", SlowDownReqOutput),
     ("flush_cache", FlushCacheReqOutput),
+    ("park_session", ParkSessionReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
@@ -300,6 +303,30 @@ class TokenizerControlMixin:
         return (
             await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
         )[0]
+
+    async def park_session(
+        self: TokenizerManager, token_ids: List[int]
+    ) -> ParkSessionReqOutput:
+        """Park-on-demand: force a session's prefix chain to L3 storage.
+
+        Fan-out to every DP scheduler; the rank whose radix tree holds the
+        prefix backs it up (the rest return 0). Used by the session-migration
+        rebalancer to make a hot unparked session L3-covered before migration
+        (see sage-session-migration-spec.md)."""
+        self.auto_create_handle_loop()
+        results = await self.park_session_communicator(
+            ParkSessionReqInput(token_ids=token_ids)
+        )
+        # ParkSessionReqOutput is not mergeable by the generic merge (it is a
+        # count, not a success/message); sum the per-rank tokens_parked and
+        # report success if any rank parked anything.
+        tokens = sum(getattr(r, "tokens_parked", 0) for r in results if r is not None)
+        success = any(getattr(r, "success", False) for r in results if r is not None)
+        return ParkSessionReqOutput(
+            success=success,
+            tokens_parked=tokens,
+            message=f"parked {tokens} tokens across {sum(1 for r in results if r is not None)} ranks",
+        )
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""

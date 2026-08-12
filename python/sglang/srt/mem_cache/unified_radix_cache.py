@@ -4,7 +4,8 @@ import logging
 import threading
 import time
 from queue import Empty, Queue
-from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
+from array import array
+from typing import TYPE_CHECKING, Iterator, List, NamedTuple, Optional, Sequence, TypeVar
 
 import torch
 
@@ -1264,6 +1265,58 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def get_prefix_hash_values(self, node_id: NodeId) -> list[str]:
         return self.tree_core.get_prefix_hash_values(node_id)
+
+    def park_session_prefix(self, token_ids: List[int]) -> int:
+        """Park-on-demand (OUR patch; see sage-session-migration-spec.md):
+        force a session's prefix chain to L3 storage on demand.
+
+        Under --hicache-write-policy write_back a hot resident session reaches
+        L3 only at device-eviction time, so migrating an unparked session would
+        re-prefill it on the target rank. This walks the session's chain (found
+        via match_prefix on the prefix token-ids) and forces every not-yet-
+        backed-up node to host (write_backup) then to storage
+        (write_backup_storage), so the chain is fully parked BEFORE the
+        rebalancer flips the pin. Returns the number of tokens parked to
+        storage; 0 when storage is off, the prefix isn't in the tree, or the
+        chain is already parked.
+        """
+        if self.disable or self.cache_controller is None or not self.enable_storage:
+            return 0
+        if not token_ids:
+            return 0
+        # Build the key the SAME way the insert/match paths do: the tree keys
+        # hold array('q') token_ids (see insert / root_node construction), and
+        # RadixKey.match asserts type(t0) is type(t1) — a plain-list key trips
+        # that assert on the first node compared. The ids must also be the
+        # SERVER-side prompt ids (chat template applied, from BOS): match walks
+        # from the root, so raw (untemplated) ids mismatch at token 0.
+        key = RadixKey(array("q", token_ids), None, is_bigram=self.tree_core.is_eagle)
+        key = key.page_aligned(self.page_size)
+        if len(key) == 0:
+            return 0
+        match_result = self.match_prefix(MatchPrefixParams(key=key))
+        best_match_node_id = match_result.best_match_node
+        if best_match_node_id is None or self.tree_core.is_root(best_match_node_id):
+            return 0
+        # Walk root -> leaf, backing up each node not yet on host (L2) then to
+        # storage (L3). _execute_and_commit_kv_backup handles the parent-first
+        # ordering; skip nodes whose L2 write failed.
+        chain: list[NodeId] = []
+        node_id = best_match_node_id
+        while node_id is not None and not self.tree_core.is_root(node_id):
+            chain.append(node_id)
+            node = self.tree_core.node_by_id(node_id)
+            node_id = node.parent.id if node.parent is not None else None
+        chain.reverse()
+        parked = 0
+        for nid in chain:
+            if not self.tree_core.is_backuped(nid):
+                if self._execute_and_commit_kv_backup(BackupKV(node_ids=[nid])) <= 0:
+                    continue
+            self.write_backup_storage(nid)
+            node = self.tree_core.node_by_id(nid)
+            parked += len(node.key) if node.key is not None else 0
+        return parked
 
     def prefetch_from_storage(
         self,
