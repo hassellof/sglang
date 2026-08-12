@@ -961,6 +961,56 @@ async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
     )
 
 
+@app.post("/v1/admin/park_session")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def park_session(request: Request):
+    """Park-on-demand: force a session's prefix chain to L3 storage.
+
+    Used by the session-migration rebalancer to make a hot unparked session
+    L3-covered before migrating it (see sage-session-migration-spec.md). Body:
+    `{"token_ids": [...]}` — the session's prefix token-ids. The request is
+    fanned out to every DP scheduler; the rank whose radix tree holds the
+    prefix backs it up to storage, the rest park nothing."""
+    body = await request.json()
+    token_ids = body.get("token_ids")
+    if not isinstance(token_ids, list) or not token_ids:
+        return ORJSONResponse(
+            {"success": False, "message": "token_ids (a non-empty list) is required."},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+    ret = await _global_state.tokenizer_manager.park_session(token_ids)
+    return ORJSONResponse(
+        {
+            "success": ret.success,
+            "tokens_parked": ret.tokens_parked,
+            "message": ret.message,
+        },
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.get("/v1/admin/sessions")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def list_sessions():
+    """Snapshot of the session inventory registry (radixrehome feed).
+
+    Returns `{"enabled": bool, "sessions": {...}}`. When
+    SGLANG_SESSION_INVENTORY_DIR is unset the inventory is disabled and
+    sessions is empty. File registry on disk remains the daemon source of
+    truth; this endpoint is for operator introspection only."""
+    inv = getattr(_global_state.tokenizer_manager, "session_inventory", None)
+    if inv is None:
+        return ORJSONResponse({"enabled": False, "sessions": {}})
+    try:
+        sessions = inv.snapshot()
+    except Exception as e:  # noqa: BLE001
+        return ORJSONResponse(
+            {"enabled": True, "sessions": {}, "message": f"snapshot failed: {e}"},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+    return ORJSONResponse({"enabled": True, "sessions": sessions})
+
+
 @app.post("/add_external_corpus")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def add_external_corpus(request: Request):

@@ -1535,6 +1535,23 @@ class FlushCacheReqOutput(BaseReq, kw_only=True):
     message: str = ""
 
 
+class ParkSessionReqInput(BaseReq, kw_only=True):
+    """Park-on-demand: force a session's prefix chain to be backed up to the
+    hicache storage backend (L3) on demand, so a hot resident session under
+    --hicache-write-policy write_back becomes L3-covered BEFORE a session
+    migration. The admin endpoint broadcasts this to every DP scheduler; the
+    rank whose radix tree holds the prefix backs it up, the rest return 0.
+    See UnifiedRadixCache.park_session_prefix."""
+
+    token_ids: List[int]
+
+
+class ParkSessionReqOutput(BaseReq, kw_only=True):
+    success: bool
+    tokens_parked: int = 0
+    message: str = ""
+
+
 class AddExternalCorpusReqInput(BaseReq, kw_only=True):
     corpus_id: Optional[str] = None
     file_path: Optional[str] = None

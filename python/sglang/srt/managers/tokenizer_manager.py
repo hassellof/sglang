@@ -95,6 +95,10 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     get_request_return_hidden_states_mode,
 )
+from sglang.srt.managers.session_inventory import (
+    SessionInventory,
+    make_inventory_from_env,
+)
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 from sglang.srt.managers.tokenizer_manager_score_mixin import TokenizerManagerScoreMixin
@@ -569,6 +573,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Subprocess liveness watchdog — set by Engine or http_server after construction
         self._subprocess_watchdog = None
+        # Session inventory (radixrehome registry feed). None when
+        # SGLANG_SESSION_INVENTORY_DIR is empty/unset — kill switch.
+        self.session_inventory: Optional[SessionInventory] = (
+            make_inventory_from_env()
+        )
 
     def init_request_logging_and_dumping(self):
         # TODO: Refactor and organize the log export code.
@@ -793,7 +802,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tokenized_obj = await self._tokenize_one_request(obj)
                     self._raise_if_logical_rid_aborted(obj.rid)
                     state = self.rid_to_state[obj.rid]
-                    if obj.return_prompt_token_ids:
+                    if obj.return_prompt_token_ids or self.session_inventory is not None:
                         state.prompt_token_ids = list(tokenized_obj.input_ids)
                     self._send_one_request(tokenized_obj)
                     async for response in self._wait_one_response(obj, request):
@@ -1786,7 +1795,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 for i in range(batch_size):
                     tmp_obj = obj[i]
                     state = self.rid_to_state[tmp_obj.rid]
-                    if tmp_obj.return_prompt_token_ids:
+                    if tmp_obj.return_prompt_token_ids or self.session_inventory is not None:
                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
                     generators.append(self._wait_one_response(tmp_obj, request))
                     rids.append(tmp_obj.rid)
@@ -1804,7 +1813,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         tokenized_obj = await self._tokenize_one_request(tmp_obj)
                         self._raise_if_logical_rid_aborted(tmp_obj.rid)
                         state = self.rid_to_state[tmp_obj.rid]
-                        if tmp_obj.return_prompt_token_ids:
+                        if tmp_obj.return_prompt_token_ids or self.session_inventory is not None:
                             state.prompt_token_ids = list(tokenized_obj.input_ids)
                         self._send_one_request(tokenized_obj)
                         generators.append(self._wait_one_response(tmp_obj, request))
@@ -1863,7 +1872,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     self._init_child_req_state(logical_rid, tmp_obj)
                     state = self.rid_to_state[tmp_obj.rid]
                     tokenized_obj.time_stats = state.time_stats
-                    if tmp_obj.return_prompt_token_ids:
+                    if tmp_obj.return_prompt_token_ids or self.session_inventory is not None:
                         state.prompt_token_ids = list(tokenized_objs[i].input_ids)
                     self._send_one_request(tokenized_obj)
                     generators.append(self._wait_one_response(tmp_obj, request))
@@ -2449,6 +2458,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         state.time_stats.convert_to_output_meta_info(
                             scheduler_time_stats, completion_tokens
                         )
+                    )
+
+                # Session inventory: upsert registry + ids file for keyed
+                # sessions once home_rank (dp_rank) is known. Best-effort;
+                # never raises into the serve path.
+                if self.session_inventory is not None and not isinstance(
+                    state.obj, EmbeddingReqInput
+                ):
+                    self.session_inventory.maybe_record_finished(
+                        obj=state.obj,
+                        input_ids=state.prompt_token_ids,
+                        home_rank=meta_info.get("dp_rank"),
+                        prompt_tokens=meta_info.get("prompt_tokens"),
                     )
 
                 self._remove_req_state(rid)
