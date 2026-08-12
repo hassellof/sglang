@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
@@ -73,6 +74,14 @@ class SWAComponent(TreeComponent):
         self.sliding_window_size = params.sliding_window_size
         # HiCache state: set to host SWA pool when HiCache enabled
         self._swa_kv_pool_host = None
+        # Rolling host-SWA reclaim registry: every node that currently holds
+        # SWA host slots, in the order those slots were handed out. Insertion
+        # order IS the reclaim order -- see `_reclaim_host_swa`.
+        self._host_backed_nodes: "OrderedDict[int, UnifiedTreeNode]" = OrderedDict()
+        # How many BACKUP_HOST transfers were declined as out-of-window.
+        # Diagnostic only: a decline is by design, not a failure, and must
+        # never reach `write_backup`'s refusal accounting.
+        self._swa_backup_declined = 0
 
     component_type = ComponentType.SWA
 
@@ -457,6 +466,12 @@ class SWAComponent(TreeComponent):
                 self.component_type
             ].value is None and not host_lru.in_list(child):
                 host_lru.insert_mru(child)
+            # Both fragments now hold host slots carved out of the one
+            # allocation the child was registered for. The new parent covers
+            # the SHALLOWER half, so it must be reclaimed no later than the
+            # child (see `_register_host_backed`).
+            self._register_host_backed(child)
+            self._register_host_backed(new_parent, before=child)
 
         # parent inherits the swa_uuid from child for swa lock ref
         new_parent.component_data[self.component_type].metadata["uuid"] = (
@@ -494,6 +509,7 @@ class SWAComponent(TreeComponent):
             host_freed = len(cd.host_value)
             host_frees[ct].append(cd.host_value)
             cd.host_value = None
+            self._host_backed_nodes.pop(node.id, None)
             if host_lru.in_list(node):
                 host_lru.remove_node(node)
 
@@ -755,6 +771,84 @@ class SWAComponent(TreeComponent):
             )
         insert_params.swa_evicted_seqlen = req.kv.swa_evicted_seqlen
 
+    # ---- Trailing-window scoping of the SWA host backup ----
+    #
+    # WHY. `BACKUP_HOST` used to push a node's ENTIRE live SWA set to the host
+    # tier while `LOAD_BACK` reads at most one `sliding_window_size`. At the
+    # DSv4 constants that is a ~4600x over-provision: the 594,946-token drill
+    # chain asked a 139,776-slot host SWA pool to hold every node that still
+    # had live device SWA (mid-prefill that is roughly half the chain, because
+    # the device window frontier only advances as `free_out_of_window_slots`
+    # runs), exhausted at 36 of 154 nodes, and `write_backup`'s parent-first
+    # invariant then disqualified all 117 descendants.
+    #
+    # WHAT. Decline the SWA `BACKUP_HOST` transfer entirely for nodes that lie
+    # wholly outside the trailing window of the chain being inserted. Demand
+    # per chain drops from the whole live-SWA set to the one node (or few
+    # nodes) covering the last `sliding_window_size` tokens.
+    #
+    # WHOLE NODES ONLY -- this is NOT the disqualified truncation design.
+    # `cd.host_value` is positionally 1:1 with the node's token range and two
+    # consumers enforce it: `commit_hicache_transfer(LOAD_BACK)` asserts
+    # `len(cd_full.value) == len(host_value)`, and
+    # `redistribute_on_node_split` slices `host_value` at a KEY length with no
+    # assert, so a suffix would be mis-sliced into wrong-position SWA (the
+    # #33656 class). Here `host_value` is only ever None or full-length: a node
+    # straddling the window boundary is backed up WHOLE, never partially.
+    #
+    # WHY THE HAZARD ANALYSIS IS EMPTY. Declining is not a new code path.
+    # `build_hicache_transfers(BACKUP_HOST)` already returns None whenever
+    # `cd.value is None` (an SWA tombstone), and the rest of the write path
+    # already handles that: `write_backup` simply omits SWA from `comp_xfers`,
+    # and `_build_sidecar_transfers` skips every SWA-DERIVED pool via its
+    # `matching_sources = comp_xfers.get(...); if not matching_sources:
+    # continue` guard -- so c4_state / c4_indexer_state / c128_state are not
+    # emitted with a dangling `indices_from_pool`, which would otherwise make
+    # `_resolve_pool_transfers_allocation` fail the whole write. Nothing is
+    # freed, so no in-flight D->H, load_back or L3 slot can be aliased.
+    #
+    # LOAD_BACK STAYS SAFE. Its walk asserts each visited node has device or
+    # host SWA, but it only ever runs from a `best_match_node` the SWA match
+    # validator accepted, and the validator accepts only after accumulating
+    # `sliding_window_size` tokens of contiguous SWA-bearing nodes ending at
+    # that node -- so the walk terminates inside that run. Identical to the
+    # pre-existing guarantee for nodes whose SWA was never backed up.
+    #
+    # WHAT THIS DOES NOT DO. It does not bound what LOAD_BACK fetches, so the
+    # upstream `swa_host_hit` TODO in `finalize_match_result` stays open and
+    # untouched. It does not scope paths that cannot know the node's position:
+    # `tail_distance=None` (the admission-match walk via `_inc_hit_count`, and
+    # `_evict_device_leaf`'s `write_back` backup) keeps the old unbounded
+    # behaviour deliberately, so `write_through_selective` and the `write_back`
+    # policy are NOT fixed by this. Our launch line is `--hicache-write-policy
+    # write_through`, where the insert walk is the only backup trigger. And it
+    # does not re-scope nodes already backed up: a node whose host SWA was
+    # taken while it was the tail keeps it when the chain grows past it --
+    # correct by construction (`host_value` stays full-length and 1:1), and
+    # released in due course by `_reclaim_host_swa` or the host LRU. No
+    # invalidation pass is needed or wanted.
+
+    def _backup_window_tokens(self) -> int:
+        """Smallest page-aligned span that still covers one sliding window.
+
+        Same alignment discipline as `_maybe_split_leaf_for_swa_lock`, which
+        caps a fresh SWA leaf at one page-aligned window.
+        """
+        page_size = self.cache.page_size
+        return (self.sliding_window_size + page_size - 1) // page_size * page_size
+
+    def _outside_backup_window(self, tail_distance: Optional[int]) -> bool:
+        """True when the node ends more than one window before the chain end.
+
+        `tail_distance` is tokens between this node's end and the chain's end.
+        A node that straddles the boundary has `tail_distance <` the window and
+        is therefore backed up whole. `None` means the caller cannot know the
+        position; keep the pre-fix behaviour rather than guess.
+        """
+        if tail_distance is None or self.sliding_window_size is None:
+            return False
+        return tail_distance >= self._backup_window_tokens()
+
     # ---- HiCache Hooks ----
 
     def prepare_prefetch(
@@ -790,6 +884,7 @@ class SWAComponent(TreeComponent):
         token_ids: Optional[Sequence[int]] = None,
         prefetch_tokens: int = 0,
         last_hash: Optional[str] = None,
+        tail_distance: Optional[int] = None,
     ) -> Optional[list[PoolTransfer]]:
         ct = self.component_type
 
@@ -800,6 +895,9 @@ class SWAComponent(TreeComponent):
         if phase == CacheTransferPhase.BACKUP_HOST:
             cd = node.component_data[ct]
             if cd.value is None:
+                return None
+            if self._outside_backup_window(tail_distance):
+                self._swa_backup_declined += 1
                 return None
             # cd.value already holds SWA-pool indices (translated at insert time).
             # Host pool indexing wants int64.
@@ -894,6 +992,7 @@ class SWAComponent(TreeComponent):
                 cd = node.component_data[ct]
                 if cd.host_value is None:
                     cd.host_value = transfers[0].host_indices.clone()
+                    self._register_host_backed(node)
             return
 
         if phase == CacheTransferPhase.LOAD_BACK:
@@ -950,6 +1049,7 @@ class SWAComponent(TreeComponent):
         ct = self.component_type
         cd = node.component_data[ct]
         cd.host_value = host_indices.clone()
+        self._register_host_backed(node)
         host_lru = self.tree_core.host_lru_lists[ct]
         if cd.value is None and not host_lru.in_list(node):
             host_lru.insert_mru(node)
@@ -1085,6 +1185,162 @@ class SWAComponent(TreeComponent):
                 x = x_next
         if enabled:
             host_lru.cursor_end()
+
+        # The host LRU only ever holds nodes whose DEVICE SWA is already gone
+        # (`evict_component` / `redistribute_on_node_split` insert on
+        # tombstone). Mid-prefill nothing has been device-evicted, so the walk
+        # above finds nothing -- the `evictable_host_leaves=0` in the fix28
+        # trace. Fall through to node-granularity rolling reclaim.
+        if tracker[ct] < num_tokens:
+            self._reclaim_host_swa(num_tokens, tracker, device_frees, host_frees)
+
+    # ---- Rolling host-SWA reclaim ----
+    #
+    # WHY THIS EXISTS. `build_hicache_transfers(BACKUP_HOST)` pushes a node's
+    # ENTIRE live SWA set to the host tier, while `...(LOAD_BACK)` reads at
+    # most one `sliding_window_size`. At the DSv4 constants that is a ~4600x
+    # over-provision: a 594K-token chain asks a 546-page (139,776-slot) host
+    # SWA pool to hold all of it, exhausts at ~23% of the chain, and the
+    # parent-first invariant in `UnifiedRadixCache.write_backup` then
+    # disqualifies every remaining descendant. Sizing cannot close it: host
+    # SWA pages are `int(device_swa_pages * ratio)`, so below ratio 1.0 the
+    # host pool is *smaller* than the device pool it must hold a superset of.
+    #
+    # WHAT THIS DOES. When the SWA host pool cannot satisfy a BACKUP_HOST
+    # allocation, free host SWA from nodes that are already backed up, oldest
+    # allocation first, at NODE GRANULARITY: a reclaimed node's whole
+    # `host_value` is freed and set to None. Host SWA becomes a rolling tail
+    # over the chain -- the deep end (what LOAD_BACK and
+    # `create_match_validator` actually read) is retained, the shallow end is
+    # recycled -- and `write_backup` stops refusing, so no
+    # `parent_not_backuped` cascade forms.
+    #
+    # WHY NODE GRANULARITY, NOT A TRAILING WINDOW WITHIN A NODE.
+    # `cd.host_value` is an index array POSITIONALLY 1:1 with the node's token
+    # range, and two consumers enforce that:
+    #   * `commit_hicache_transfer(LOAD_BACK)` asserts
+    #     `len(cd_full.value) == len(cd.host_value)` and builds the full->SWA
+    #     translation positionally across the node's whole range;
+    #   * `redistribute_on_node_split` slices `host_value` at
+    #     `len(new_parent.key)` -- a KEY length -- with no assert to catch a
+    #     mismatch. A suffix-truncated `host_value` would be sliced at the
+    #     wrong offset and hand the parent SWA indices belonging to different
+    #     tokens: silent wrong-position SWA, the #33656 corruption class.
+    # `BACKUP_STORAGE`'s `cd.host_value[-num_pages * page_size:]` is NOT a
+    # precedent -- it ships hash-keyed objects to an external store and never
+    # assigns `cd.host_value`, so there is no in-tree positional index to keep
+    # aligned. Reclaiming whole nodes keeps every retained node at full 1:1
+    # coverage, so all four `cd.host_value` consumers are untouched.
+    #
+    # WHAT THIS DOES NOT DO. It does not bound what LOAD_BACK fetches, so the
+    # upstream TODO in `finalize_match_result` (cap `swa_host_hit` at
+    # `sliding_window_size`) stays open and untouched: that cap is explicitly
+    # conditioned on a bounded load_back, which this change does not
+    # implement. `swa_host_hit` keeps over-reporting by at most the last
+    # node's overshoot, before and after, and over-reporting is the safe
+    # direction (the scheduler reserves more device SWA than the restore
+    # consumes). It also does not make host SWA hold a whole chain -- a chain
+    # longer than the pool keeps only its tail, by design.
+
+    def _register_host_backed(
+        self, node: UnifiedTreeNode, before: Optional[UnifiedTreeNode] = None
+    ) -> None:
+        """Record that `node` holds SWA host slots. Insertion order is the
+        reclaim order (oldest allocation first).
+
+        `before` splices `node` in ahead of an existing entry. Only the node
+        split needs it: both fragments come out of the one allocation the
+        child was registered for, and the new parent covers the shallower
+        half, so it must not outlive the child in reclaim order.
+        """
+        reg = self._host_backed_nodes
+        if node.id not in reg:
+            reg[node.id] = node
+        if before is None or before.id == node.id or before.id not in reg:
+            return
+        # Rotate `before` and everything after it to the back, order-preserving,
+        # so `node` ends up immediately ahead of `before`.
+        tail = [nid for nid in reg if nid != node.id]
+        try:
+            start = tail.index(before.id)
+        except ValueError:  # pragma: no cover - guarded above
+            return
+        for nid in tail[start:]:
+            reg.move_to_end(nid)
+
+    def _reclaim_host_swa(
+        self,
+        num_tokens: int,
+        tracker: dict[ComponentType, int],
+        device_frees: dict[ComponentType, list[torch.Tensor]],
+        host_frees: dict[ComponentType, list[torch.Tensor]],
+    ) -> None:
+        """Free host SWA from already-backed-up nodes, oldest allocation first.
+
+        Unlike `drive_host_eviction`'s host-LRU walk this does NOT require the
+        node to have been device-evicted (`_is_host_leaf` gates on
+        `node.evicted`, which is never true mid-prefill), and it never
+        cascades: only this component's host slots are released. The node
+        keeps its FULL host value, so it stays `backuped` and the parent-first
+        invariant in `write_backup` still holds for its descendants.
+
+        Two guards, both reading state that already exists:
+
+        * `write_through_pending_id is not None` -- the node's D->H copy is
+          queued but unacked. Its `host_indices` were handed to a transfer on
+          the controller's write stream; freeing them lets the pool re-hand
+          the same slots to another node's backup. The device-side
+          `inc_lock_ref` taken by `write_backup` does NOT cover this: that is
+          a DEVICE lock, while the host tier is gated on `host_lock_ref`.
+          `_replace_pending_write_through_node` propagates the id to both
+          fragments of a split, and `_finish_write_through_ack` clears it, so
+          this predicate is exactly "in flight" with no new bookkeeping.
+        * `host_lock_ref > 0` -- an in-flight `load_back` (H->D) or
+          `write_backup_storage` (host->L3) holds the host lock over this
+          node's slots; both take it via `inc_host_lock_ref` before the
+          transfer is observable.
+
+        The third guard the design calls for -- never free slots allocated
+        within the CURRENT `_resolve_pool_transfers_allocation` call, whose
+        local `newly_allocated` list this code cannot see -- holds by
+        construction rather than by test: reclaim only ever frees slots
+        reachable through some node's `cd.host_value`, and a resolve's own
+        allocations are not attached to any node until
+        `commit_hicache_transfer(BACKUP_HOST)` runs, which is after `write()`
+        returns. `TestReclaimGuards.test_reclaim_never_frees_in_flight_resolve_slots`
+        executes that argument rather than asserting it.
+        """
+        ct = self.component_type
+        if self._swa_kv_pool_host is None:
+            return
+        # Snapshot: `evict_component` mutates the registry as we free.
+        for node_id in list(self._host_backed_nodes):
+            if tracker[ct] >= num_tokens:
+                return
+            node = self._host_backed_nodes.get(node_id)
+            if node is None:
+                continue
+            cd = node.component_data[ct]
+            if cd.host_value is None:
+                # Stale entry (freed by a path that did not unregister).
+                self._host_backed_nodes.pop(node_id, None)
+                continue
+            if node.write_through_pending_id is not None:
+                continue
+            if cd.host_lock_ref > 0:
+                continue
+            # Whole-node free: `evict_component(HOST)` returns every slot to
+            # the pool, clears `host_value` in the same step, drops the host
+            # LRU entry and unregisters. There is no state in which a node
+            # holds a partially reclaimed `host_value`.
+            self.tree_core._evict_component_and_detach_lru(
+                node,
+                self,
+                device_frees=device_frees,
+                host_frees=host_frees,
+                target=EvictLayer.HOST,
+                tracker=tracker,
+            )
 
     def free_host_values(self, host_values: list[torch.Tensor]) -> None:
         if self._swa_kv_pool_host is None:

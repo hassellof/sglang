@@ -660,9 +660,16 @@ class TreeComponent(ABC):
         token_ids: Optional[Sequence[int]] = None,
         prefetch_tokens: int = 0,
         last_hash: Optional[str] = None,
+        tail_distance: Optional[int] = None,
     ) -> Optional[list[PoolTransfer]]:
         """Build transfer descriptors for this component in the given phase.
-        Returns None if the component has nothing to transfer."""
+        Returns None if the component has nothing to transfer.
+
+        `tail_distance` is the number of tokens between the end of `node` and
+        the end of the chain being inserted, or None when the caller cannot
+        know it. Only SWA uses it, to scope BACKUP_HOST to the trailing
+        window; every other component ignores it.
+        """
         return None
 
     def commit_hicache_transfer(
