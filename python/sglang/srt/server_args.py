@@ -435,6 +435,20 @@ def add_linear_attn_kernel_backend_choices(choices):
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend(choices)
 
 
+def _apply_sm120_fp8_wo_a_gemm_default() -> None:
+    """Gate the SM120 FP8 W_o_A GEMM override on the DeepGEMM ue8m0 capability.
+
+    Builds that cannot run the GEMM (DEEPGEMM_SCALE_UE8M0 false) get
+    SGLANG_OPT_FP8_WO_A_GEMM forced off. Capable builds are left untouched, so
+    they keep the global default or an explicit setting. The capability check in
+    `_handle_environment_variables` stays authoritative.
+    """
+    from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
+
+    if not DEEPGEMM_SCALE_UE8M0:
+        envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+
+
 @dataclasses.dataclass
 class ServerArgs:
     """Server-wide configuration for SGLang.
@@ -1043,38 +1057,10 @@ class ServerArgs:
                 "follow_bootstrap_room",
                 "total_requests",
                 "total_tokens",
-                "prefix_affinity",
             ],
         ),
         NS("parallel"),
     ] = "auto"
-    prefix_affinity_fallback: A[
-        str,
-        Arg(
-            help=(
-                "Load-balance method used by 'prefix_affinity' when it cannot honor "
-                "affinity (no routing key and token fallback disabled or unusable, "
-                "or all live ranks over the load-skew threshold)."
-            ),
-            choices=["round_robin", "total_requests", "total_tokens"],
-        ),
-    ] = "total_tokens"
-    prefix_affinity_max_load_skew: A[
-        float,
-        "For 'prefix_affinity': a rank is considered overloaded when its load exceeds "
-        "this multiple of the average load across live ranks, at which point routing "
-        "skips it to keep load balanced. Must be >= 1.0.",
-    ] = 1.5
-    prefix_affinity_hash_tokens: A[
-        int,
-        "For 'prefix_affinity': number of leading input tokens hashed for the "
-        "token-prefix fallback key when a request has no routing key.",
-    ] = 4096
-    prefix_affinity_disable_token_fallback: A[
-        bool,
-        "For 'prefix_affinity': disable the token-prefix fallback key so that requests "
-        "without an explicit routing key go straight to the fallback load-balance method.",
-    ] = False
     attn_cp_size: A[
         int,
         Arg(
@@ -1986,13 +1972,6 @@ class ServerArgs:
         "Inkling: replace the attention/MLP output all-reduce with a hidden-dimension reduce-scatter, run the channelwise output short convolution on the [T, H/P] shard, then all-gather before the residual add. This shards the convolution cache across tensor-parallel ranks without changing communication volume.",
         NS("exec.comm"),
     ] = False
-    enable_flashinfer_allreduce_only: A[
-        bool,
-        Arg(
-            help="Route allreduce-only tensor-parallel all-reduce through FlashInfer kAllReduce when the flashinfer allreduce workspace is already initialized (requires --flashinfer-allreduce-fusion-backend). Falls back to NCCL for non-2D tensors or when the workspace is unavailable.",
-            resolvable=True,
-        ),
-    ] = False
     pre_warm_nccl: A[
         bool,
         "Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for AMD/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL).",
@@ -2014,11 +1993,10 @@ class ServerArgs:
         Arg(
             help=(
                 "Enable FlashInfer allreduce fusion and choose backend. "
-                "Requires SM90, SM10X, or SM12X (SM120/SM121) NVIDIA GPUs. "
+                "Requires SM90 or SM10X NVIDIA GPUs. "
                 "Defaults to auto. "
                 "'auto': choose mnnvl on Blackwell (SM100/SM103) systems "
-                "(single- and multi-node) and trtllm on SM90, SM120, and SM121 "
-                "single-node systems. "
+                "(single- and multi-node) and trtllm on SM90 single-node systems. "
                 "'trtllm': available on single-node systems only. "
                 "'mnnvl': available on SM90 single-node systems and SM100/SM103 "
                 "single-node or multi-node systems via MNNVL fabric. "
@@ -3900,15 +3878,6 @@ class ServerArgs:
             )
             return
 
-        if (
-            self.load_balance_method == "prefix_affinity"
-            and self.prefix_affinity_max_load_skew < 1.0
-        ):
-            raise ValueError(
-                "--prefix-affinity-max-load-skew must be >= 1.0, got "
-                f"{self.prefix_affinity_max_load_skew}"
-            )
-
     def _handle_ssl_validation(self):
         """Ensure SSL arguments are consistent and referenced files exist."""
         if self.ssl_keyfile and not self.ssl_certfile:
@@ -5350,15 +5319,19 @@ class ServerArgs:
 
             run_post_process_pass(self, _deepseek_v4_sm120_moe)
             if is_sm120_supported():
-                # SM120 lacks tcgen05/TMEM: disable features that depend on
-                # DeepGEMM or require >99KB SMEM (topk_v2).
-                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+                # Keep the W_o_A DeepGEMM default only when the installed build
+                # supports SM120; disable features that require >99KB SMEM
+                # (topk_v2).
+                _apply_sm120_fp8_wo_a_gemm_default()
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
-                envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
-                envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
-                # Prefer TileLang over the Torch fallback, but do not override
-                # an explicit setting: a DeepGEMM build with SM120 attention
-                # support can select fp8_paged_mqa_logits instead.
+                if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.is_set():
+                    envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+                if not envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.is_set():
+                    envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+                # Out of the box the indexer runs the TileLang kernel (works on
+                # stock DeepGEMM); both knobs stay env-overridable so a DeepGEMM
+                # build with SM120 attention support can opt into
+                # fp8_paged_mqa_logits by setting them to 0.
                 if not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.is_set():
                     envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
                 if not envs.SGLANG_OPT_USE_TILELANG_INDEXER.is_set():
