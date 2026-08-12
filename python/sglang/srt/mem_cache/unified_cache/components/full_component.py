@@ -350,6 +350,7 @@ class FullComponent(TreeComponent):
         token_ids: Optional[Sequence[int]] = None,
         prefetch_tokens: int = 0,
         last_hash: Optional[str] = None,
+        tail_distance: Optional[int] = None,
     ) -> Optional[list[PoolTransfer]]:
         ct = self.component_type
 

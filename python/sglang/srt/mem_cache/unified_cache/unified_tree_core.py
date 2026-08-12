@@ -595,6 +595,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         return DecLockRefResult()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        self._pending_match_backups: list[UnifiedTreeNode] = []
         key = params.key
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
         if len(key) == 0:
@@ -603,6 +604,19 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         if len(key) == 0:
             return self._empty_match_result
 
+        # Reuse counting for hit_count-based eviction policies (slru/lfu, via
+        # --radix-eviction-policy): a node is "reused" when a NEW request's
+        # admission match walks it. The scheduler sets params.req only on
+        # admission-path matches (schedule_batch.init_next_round_input,
+        # schedule_policy._match_prefix_for_req with include_req=True); the
+        # cache's own internal re-matches (cache_unfinished_req fires one per
+        # prefill chunk) pass only the key. Counting on the INSERT walk
+        # instead is self-referential on the real scheduler call sequence:
+        # the final prefill chunk's cache_unfinished_req arrives without
+        # chunked=True (batch_result_processor.py) and the completion insert
+        # in cache_finished_req is unguarded, so every completed chunked
+        # request walked its own chain to hit_count>=2 and protected itself,
+        # degenerating SLRU to pure LRU.
         (
             value,
             best_match_node,
@@ -610,7 +624,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_value_len,
             full_kv_hit_length,
             action,
-        ) = self._match_prefix_helper(key)
+        ) = self._match_prefix_helper(key, count_reuse=params.req is not None)
         return self._match_post_processor(
             params,
             value,
@@ -621,7 +635,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             action,
         )
 
-    def _match_prefix_helper(self, key: RadixKey) -> tuple[
+    def _match_prefix_helper(self, key: RadixKey, count_reuse: bool = False) -> tuple[
         list[torch.Tensor],
         UnifiedTreeNode,
         UnifiedTreeNode,
@@ -688,12 +702,18 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 node, action = self._split_node(child.key, child, prefix_len)
                 if not node.evicted:
                     value.append(node.component_data[BASE_COMPONENT_TYPE].value)
+                # after a split the matched half inherited the pre-split
+                # hit_count (see _split_node); it is the node being reused
+                if count_reuse:
+                    self._inc_hit_count(node)
                 _update_best_if_valid(node)
                 break
 
             if not child.evicted:
                 value.append(child.component_data[BASE_COMPONENT_TYPE].value)
             node = child
+            if count_reuse:
+                self._inc_hit_count(node)
             _update_best_if_valid(node)
             key = key[prefix_len:]
             if len(key):
@@ -759,11 +779,18 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 best_value_len=best_match_device_value_len,
             )
         # Expose only NodeIds outside TreeCore.
+        # Collect any pending write-through backups from the admission-path
+        # match walk into the action list.
+        all_actions = [action] if action is not None else []
+        for backup_node in self._pending_match_backups:
+            all_actions.append(self._build_backup_kv_action(backup_node))
+        self._pending_match_backups.clear()
+
         return result._replace(
             last_device_node=result.last_device_node.id,
             last_host_node=result.last_host_node.id,
             best_match_node=result.best_match_node.id,
-            cache_actions=[action] if action is not None else [],
+            cache_actions=all_actions,
         )
 
     @property
@@ -801,20 +828,58 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     continue
                 comp.refresh_lru(LRURefreshPhase.WALKDOWN, node, self.root_node)
 
-    def _inc_hit_count_and_check(
+    def _maybe_write_backup(
         self, node: UnifiedTreeNode, chunked: bool = False
     ) -> bool:
-        """Increment hit count; check whether a write backup should be fired."""
+        """Run the HiCache write-through backup check WITHOUT counting a reuse.
+
+        Upstream conflates two unrelated jobs in `_inc_hit_count_and_check`:
+        reuse accounting for the hit_count-based eviction policies, and the
+        write-through trigger that populates the host (L2) tier. Moving the
+        reuse accounting to the admission-path match walk (see match_prefix)
+        is correct for slru ordering, but it must not take the L2 write with
+        it: under `--hicache-write-policy write_through`
+        (write_through_threshold == 1) the INSERT walk is the only thing that
+        ever pushes a freshly built chain to the host tier. Without this the
+        policy silently degrades to write-on-first-reuse, and a chain whose
+        SWA is tombstoned by other requests' pool churn before it is ever
+        reused has no host copy to restore from - the exact retention failure
+        HiCache is being enabled to fix.
+
+        `chunked` preserves the stock guard: intermediate prefill chunks do
+        not trigger a backup; the final (unguarded) chunk's insert walk
+        descends the whole chain and backs up every node on it.
+        """
         if node.evicted or chunked:
             return False
         if self.is_write_back:
             return False
-        node.hit_count += 1
         return (
             self.enable_hicache
             and not node.backuped
             and node.hit_count >= self.write_through_threshold
         )
+
+    def _inc_hit_count(self, node: UnifiedTreeNode) -> None:
+        """Count a reuse, then run the write-through check.
+
+        Called only from the admission-path match walk (count_reuse in
+        _match_prefix_helper), so hit_count means "reuse events by later
+        requests" - never the request's own insert/re-match traffic. The
+        backup check still runs here so `write_through_selective`
+        (threshold 2) keeps backing up on the first genuine reuse.
+        """
+        if node.evicted:
+            return
+        if self.is_write_back:
+            return
+        node.hit_count += 1
+        if (
+            self.enable_hicache
+            and not node.backuped
+            and node.hit_count >= self.write_through_threshold
+        ):
+            self._pending_match_backups.append(node)
 
     def begin_insert(self, params: InsertParams) -> InsertStepResult:
         """Start the insert, running to its first barrier or completion."""
@@ -951,8 +1016,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     FreeDeviceKV([value_slice[dup_start:consumed_from]])
                 )
 
-        if self._inc_hit_count_and_check(node, state.params.chunked):
-            step_actions.append(self._build_backup_kv_action(node))
+        # `key` still carries this node's own `prefix_len`, so what is left
+        # after it is the node's distance to the end of the chain. The SWA
+        # component uses it to scope its host backup to the trailing
+        # window; every other component ignores it.
+        if self._maybe_write_backup(node, state.params.chunked):
+            step_actions.append(
+                self._build_backup_kv_action(
+                    node, tail_distance=len(key) - prefix_len
+                )
+            )
         state.node = node
         state.total_prefix_length += prefix_len
         state.key = key[prefix_len:]
@@ -1000,11 +1073,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     LRURefreshPhase.INSERT_END, state.target_node, self.root_node
                 )
 
-        if state.is_new_leaf and self._inc_hit_count_and_check(
+        # The new leaf ends the chain.
+        if state.is_new_leaf and self._maybe_write_backup(
             state.target_node, state.params.chunked
         ):
             state.pending_actions.append(
-                self._build_backup_kv_action(state.target_node)
+                self._build_backup_kv_action(state.target_node, tail_distance=0)
             )
 
     def _split_node(
@@ -1061,6 +1135,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         priority: int = 0,
     ) -> UnifiedTreeNode:
         new_node = self._new_node(priority=priority)
+        # Creation counts as the first hit: with SLRUStrategy's default
+        # protected_threshold=2 a node becomes protected on its first reuse
+        # by a later request's admission match (see match_prefix).
+        new_node.hit_count = 1
         new_node.parent = parent
         new_node.key = key
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
@@ -1629,11 +1707,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def _build_backup_spec(self, node: UnifiedTreeNode):
         """Gather device value backup spec."""
         device_value = node.component_data[BASE_COMPONENT_TYPE].value
+        tail_distance = getattr(node, "_swa_backup_tail_distance", None)
         comp_xfers: dict[ComponentType, list] = {}
         for comp in self.components:
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue
-            t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
+            t = comp.build_hicache_transfers(
+                node, CacheTransferPhase.BACKUP_HOST, tail_distance=tail_distance
+            )
             if t:
                 comp_xfers[comp.component_type] = t
         return device_value, comp_xfers
@@ -1713,7 +1794,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         return node.key.extra_key if node.key else None
 
     def _build_backup_kv_action(
-        self, node: UnifiedTreeNode, write_back: bool = False
+        self,
+        node: UnifiedTreeNode,
+        write_back: bool = False,
+        tail_distance: Optional[int] = None,
     ) -> BackupKV:
         """Build the backup action for a node and its unbacked ancestors."""
         chain = [node]
@@ -1728,6 +1812,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 ancestor = ancestor.parent
             # write_through: Ancestors first to preserve backup invariant
             chain.reverse()
+        # Stash tail distances so _build_backup_spec can scope SWA transfers.
+        if tail_distance is not None:
+            # chain is root-first; the LAST element is the node whose
+            # tail_distance was given. Each earlier element (ancestor) is
+            # further from the chain end by the sum of the lengths of all
+            # nodes after it in the chain.
+            for i, target in enumerate(chain):
+                target._swa_backup_tail_distance = tail_distance + sum(
+                    len(chain[j].key) for j in range(i + 1, len(chain))
+                )
         return BackupKV([target.id for target in chain])
 
     def commit_hicache_transfers(

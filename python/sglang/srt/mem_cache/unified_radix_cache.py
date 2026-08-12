@@ -77,6 +77,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
         PrefetchOperation,
     )
+    from sglang.srt.mem_cache.memory_pool_host import PoolEntry
     from sglang.srt.server_args import ServerArgs
 
 
@@ -211,6 +212,15 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_timeout_base = 1.0
         self.prefetch_timeout_per_page = 0.25
         self.hicache_storage_pass_prefix_keys = False
+
+        # L1<->L2 observability (logging only). The D->H / H->D paths emit
+        # nothing upstream, so "no hicache lines in the log" is what a
+        # WORKING tier looks like as well as a broken one -- and
+        # write_backup's three bail-outs are all silent `return 0`s. These
+        # counters drive rate-limited log lines at those exact points.
+        self._l2_backup_ok = 0
+        self._l2_loadback_ok = 0
+        self._l2_backup_fail: dict[str, int] = {}
 
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
@@ -378,6 +388,15 @@ class UnifiedRadixCache(BasePrefixCache):
     def release_host_resources(self) -> None:
         if self.host_pool_group is not None:
             self.host_pool_group.destroy()
+
+    def register_hicache_draft_pools(
+        self, specs: list[SidecarPoolSpec], entries: list[PoolEntry]
+    ) -> None:
+        if self.cache_controller is None:
+            raise RuntimeError("HiCache controller is not attached.")
+        for spec, entry in zip(specs, entries, strict=True):
+            self.cache_controller.register_host_pool_entry(entry)
+            self.register_sidecar_pool(spec)
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         result = self.session.try_match_prefix(params)
@@ -863,6 +882,57 @@ class UnifiedRadixCache(BasePrefixCache):
 
     # ---- HiCache: Backup / LoadBack ----
 
+    _L2_LOG_EVERY = 1024
+
+    def _l2_should_log(self, n: int) -> bool:
+        """First occurrence, then every _L2_LOG_EVERY-th.
+
+        write_backup runs once per node, so an unconditional log would flood
+        under prefill; the first event is the diagnostic one and must never
+        be dropped, hence `n == 1` rather than a pure modulus.
+        """
+        return n == 1 or n % self._L2_LOG_EVERY == 0
+
+    def _l2_exhausted_pool(self) -> str:
+        """Which sidecar host pool refused the write: `name(requested=,avail=)`.
+
+        The anchor occupancy logged next to this is not the binding resource
+        -- `HybridCacheController.write` allocates anchor slots first and
+        frees them again when a sidecar allocation fails.
+        """
+        info = getattr(self.cache_controller, "_l2_last_alloc_failure", None)
+        if not info:
+            return "unknown"
+        name, requested, avail = info
+        return f"{name}(requested={requested},avail={avail})"
+
+    def _l2_host_state(self) -> tuple[int, int, int]:
+        """(available, size, evictable host leaves) of the host tier."""
+        host = self.cache_controller.mem_pool_host
+        return (
+            host.available_size(),
+            host.size,
+            len(self.tree_core.evictable_host_leaves),
+        )
+
+    def _l2_note_backup_failure(self, reason: str, node_id: NodeId, **fields) -> None:
+        n = self._l2_backup_fail.get(reason, 0) + 1
+        self._l2_backup_fail[reason] = n
+        if not self._l2_should_log(n):
+            return
+        avail, size, leaves = self._l2_host_state()
+        logger.warning(
+            "HiCache L2 write_backup FAILED reason=%s node=%s %s "
+            "host_avail=%d host_size=%d evictable_host_leaves=%d occurrences=%d",
+            reason,
+            node_id,
+            " ".join(f"{k}={v}" for k, v in fields.items()),
+            avail,
+            size,
+            leaves,
+            n,
+        )
+
     def _execute_and_commit_kv_backup(
         self, action: BackupKV, write_back: bool = False
     ) -> int:
@@ -878,6 +948,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 node_id, device_value, comp_xfers, sidecar_xfers
             )
             if host_indices is None:
+                self._l2_note_backup_failure(
+                    "controller_write_refused",
+                    node_id,
+                    kv_tokens=len(device_value),
+                    exhausted=self._l2_exhausted_pool(),
+                )
                 return 0
             self.tree_core.commit_backup(node_id, host_indices, comp_xfers)
             lock_params = None
@@ -885,6 +961,20 @@ class UnifiedRadixCache(BasePrefixCache):
                 lock_params = self.inc_lock_ref(node_id).to_dec_params()
             self._track_write_through_node(node_id, lock_params)
             written = len(host_indices)
+
+            self._l2_backup_ok += 1
+            if self._l2_should_log(self._l2_backup_ok):
+                avail, size, leaves = self._l2_host_state()
+                logger.info(
+                    "HiCache L2 write_backup ok node=%s tokens=%d total_ok=%d "
+                    "host_avail=%d host_size=%d evictable_host_leaves=%d",
+                    node_id,
+                    len(host_indices),
+                    self._l2_backup_ok,
+                    avail,
+                    size,
+                    leaves,
+                )
         return written
 
     def _build_backup_sidecar(self, device_value, comp_xfers):
@@ -900,7 +990,16 @@ class UnifiedRadixCache(BasePrefixCache):
         host_avail = self.cache_controller.mem_pool_host.available_size()
         if host_avail < kv_tokens:
             needed = kv_tokens - host_avail
-            if self.evict_host(needed) < needed:
+            evicted = self.evict_host(needed)
+            if evicted < needed:
+                self._l2_note_backup_failure(
+                    "host_evict_shortfall",
+                    node_id,
+                    kv_tokens=kv_tokens,
+                    host_avail_before=host_avail,
+                    evicted=evicted,
+                    needed=needed,
+                )
                 return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
@@ -1059,6 +1158,15 @@ class UnifiedRadixCache(BasePrefixCache):
             self.inc_lock_ref(node_id).to_dec_params(),
             host_anchor_params,
         )
+
+        self._l2_loadback_ok += 1
+        if self._l2_should_log(self._l2_loadback_ok):
+            logger.info(
+                "HiCache L2 load_back ok node=%s tokens=%d total_ok=%d",
+                node_id,
+                kv_tokens,
+                self._l2_loadback_ok,
+            )
 
         return True
 
