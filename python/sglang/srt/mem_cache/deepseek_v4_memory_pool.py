@@ -43,9 +43,35 @@ def get_compress_state_ring_size(
             raise AssertionError("online c128 does not support MTP")
         return 1
     if is_speculative:
-        return 16 if compress_ratio == 4 else 256
+        if compress_ratio == 4:
+            # DEPTH-SCALED c4 COMPRESS RING (ombori 2026-08-05).
+            # The SWA ring already scales with draft depth
+            # (`sliding_window + spec_extra`), but this ring was a constant
+            # 16 positions regardless of `speculative_num_draft_tokens`.
+            # c4 runs in overlap mode (c_plan.cuh: window_size = 2*cr = 8
+            # tokens of lookback per state), so a verify step touches about
+            # draft_writes + verify_window + lookback positions: gamma 3 ->
+            # 3+4+8 = 15 (fits 16); gamma 5 -> 5+6+8 = 19 (overflows, so a
+            # stale draft state is read back as valid -> corrupted
+            # compressed history -> repetition collapse). Ring must divide
+            # swa_page_size (256) and be a multiple of compress_ratio.
+            ndt = getattr(get_server_args(), "speculative_num_draft_tokens", 0) or 0
+            need = ndt + 3 * compress_ratio
+            ring = 16
+            while ring < need and ring < 64:
+                ring *= 2
+            return ring
+        return 256
     else:
         return 8 if compress_ratio == 4 else 128
+
+
+def get_compress_state_write_pad(compress_ratio: int, ring_size: int) -> int:
+    """Largest draft-token count this ring can serve; mirrors `mtp_pad` in `c_plan.cuh`
+    (the bound is derived there). Zero for a non-speculative ring, which is exactly one
+    window wide."""
+    window_size = compress_ratio * (2 if compress_ratio == 4 else 1)
+    return ring_size - window_size + 2 if ring_size > window_size else 0
 
 
 class DeepSeekV4SingleKVPool(KVCache):

@@ -677,6 +677,21 @@ class DeepseekV4HipRadixBackend(
             extend_lens_cpu=None,
             use_prefill_cuda_graph=True,
             num_q_tokens=num_draft_tokens * bs,
+            # 32183 COMPLETION (v0.5.16 backport gap): upstream #32183 threads
+            # verify_width only through deepseek_v4_backend.py, but THIS
+            # variant is the live path (upstream's patched sites reference
+            # self.speculative_num_draft_tokens, unset there -> never run).
+            # Without this, create_paged_compressor_data defaults 0 ->
+            # c_plan mtp_pad falls back to min(ring-cr, kMaxMTPDraftTokens=4)
+            # -> the compressed-state write plan DROPS verifier rows at
+            # depth>=4 (gamma>=4) -> repetition-collapse corruption.
+            verify_width=num_draft_tokens,
+        )
+        # runtime marker (A/B protocol: kernel/plan patches must prove they
+        # execute) — one line per verify-metadata build at INFO.
+        logger.info(
+            "dspark 32183-completion: verify_width=%d threaded to c_plan",
+            num_draft_tokens,
         )
         return DSV4Metadata(
             core_attn_metadata,
