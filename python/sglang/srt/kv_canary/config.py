@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -11,6 +12,8 @@ from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
+
+logger = logging.getLogger(__name__)
 
 
 class CanaryMode(str, Enum):
@@ -66,6 +69,26 @@ class CanaryConfig:
             raise ValueError(
                 f"kv-canary: kv_canary must be one of none/log/raise, got {mode_raw!r}"
             )
+
+        # DSPARK ragged-verify "compact" writes draft tokens into the SWA KV
+        # cache that the canary's committed-token chain-hash model cannot
+        # represent: every such write trips `verify_chain_hash` with
+        # expected_token=-1, and at high concurrency the violation storm
+        # OOB-crashes the server (surfaced as an IMA in the violation reporter,
+        # reproduced at bench_serving conc64/128 on sage 2026-08-12). The SWA
+        # canary model is fundamentally incompatible with compact verify;
+        # disable it for that config with a logged reason instead of crashing.
+        if mode_raw != "none":
+            spec_algo = str(getattr(server_args, "speculative_algorithm", "")).upper()
+            ragged_mode = envs.SGLANG_RAGGED_VERIFY_MODE.get().strip().lower()
+            if spec_algo == "DSPARK" and ragged_mode == "compact":
+                logger.warning(
+                    "kv-canary: DSPARK ragged-verify 'compact' writes draft tokens to SWA KV "
+                    "that the canary cannot model (false verify_chain_hash storm -> server IMA). "
+                    "Disabling the canary for this config; run SGLANG_RAGGED_VERIFY_MODE=static "
+                    "to keep it active."
+                )
+                mode_raw = "none"
 
         real_kv_raw = server_args.kv_canary_real_data.strip().upper()
 
