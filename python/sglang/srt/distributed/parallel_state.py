@@ -384,6 +384,23 @@ class GroupCoordinator:
         assert self.cpu_group is not None
         assert self.device_group is not None
 
+        # PCIe IPC all-reduce workspace (flashinfer PR #4393 custom AR), opted
+        # in via SGLANG_ALLREDUCE_BACKEND=pcie_ipc_ar. Built once per group;
+        # routes small-message all-reduces (<= SGLANG_PCIE_IPC_AR_MAX_NUMEL)
+        # away from NCCL, which is the per-decode-step win on our PCIe box.
+        self._pcie_ipc_ws = None
+        if envs.SGLANG_ALLREDUCE_BACKEND.get() == "pcie_ipc_ar":
+            try:
+                from flashinfer.comm.pcie_ipc_ar import PcieIpcAllReduceWorkspace
+
+                self._pcie_ipc_ws = PcieIpcAllReduceWorkspace(
+                    group=self.device_group,
+                    max_numel=envs.SGLANG_PCIE_IPC_AR_MAX_NUMEL.get(),
+                )
+            except Exception as e:  # noqa: BLE001 - optional accelerator; log only
+                logger.warning("PCIe IPC all-reduce unavailable: %s", e)
+                self._pcie_ipc_ws = None
+
         # Import communicators
         self.use_pynccl = use_pynccl
         self.use_pymscclpp = use_pymscclpp
@@ -726,6 +743,24 @@ class GroupCoordinator:
             )
             if result is not None:
                 return result
+
+        # PCIe IPC all-reduce (flashinfer PR #4393): route eligible small
+        # contiguous tensors to the custom IPC-AR instead of NCCL. Out-of-place
+        # (returns a new tensor); falls back on any error (unsupported shape,
+        # JIT kernel not compiled yet, etc.).
+        _pcie = getattr(self, "_pcie_ipc_ws", None)
+        if (
+            _pcie is not None
+            and input_.ndim >= 1
+            and input_.is_contiguous()
+            and input_.numel() > 0
+            and input_.dtype in (torch.bfloat16, torch.float16)
+        ):
+            try:
+                if _pcie.supports(input_):
+                    return _pcie.all_reduce(input_)
+            except Exception:  # noqa: BLE001 - fall back to NCCL
+                pass
 
         outplace_all_reduce_method = self._resolve_outplace_all_reduce_method(
             input_=input_,

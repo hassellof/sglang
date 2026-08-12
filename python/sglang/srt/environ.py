@@ -973,6 +973,11 @@ class Envs:
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
+    # All-reduce backend override for the TP group: "auto" (default) or
+    # "pcie_ipc_ar" (route eligible small-message all-reduces to flashinfer's
+    # PCIe IPC custom AR, PR #4393; token-capped by SGLANG_PCIE_IPC_AR_MAX_NUMEL).
+    SGLANG_ALLREDUCE_BACKEND = EnvStr("auto")
+    SGLANG_PCIE_IPC_AR_MAX_NUMEL = EnvInt(16384)
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
