@@ -405,6 +405,19 @@ class Envs:
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_TARGET_VERIFY = EnvInt(1)
     SGLANG_SCHEDULER_RECV_SKIPPER_WEIGHT_NONE = EnvInt(1)
 
+    # DP controller: prefix_affinity first-touch load-aware placement
+    # (data_parallel_controller.py). A routing key's FIRST placement picks
+    # the least-loaded live rank instead of the raw HRW winner -- turn 1 is
+    # the one moment placement is free, there is no cache to preserve yet --
+    # and an in-controller LRU-bounded binding table keeps later turns on
+    # whatever rank the key actually landed on. False restores stateless
+    # HRW placement (pre-fix behavior).
+    SGLANG_PREFIX_AFFINITY_FIRST_TOUCH_LB = EnvBool(True)
+    # Max routing_key -> rank bindings kept before LRU eviction. An evicted
+    # key degrades to a fresh first touch on its next turn (one-time cache
+    # miss at worst). ~tens of bytes per entry.
+    SGLANG_PREFIX_AFFINITY_BINDING_CAPACITY = EnvInt(16384)
+
     # PD Disaggregation (runtime)
     # NOTE: For SGLANG_DISAGGREGATION_THREAD_POOL_SIZE, the effective default is
     # computed dynamically at runtime based on cpu_count; see disaggregation backends.
@@ -440,6 +453,42 @@ class Envs:
     SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
+    # Decode-aware adaptive prefill chunking (see scheduler_components/
+    # decode_aware_chunking.py): when any DP-attention rank has decode work
+    # in flight, cap the per-pass chunked-prefill budget at this many tokens
+    # (per rank, i.e. compared against the already-DP-divided
+    # chunked_prefill_size) so a giant prefill's joint DP steps stay short
+    # and co-running decodes keep stepping. Aligned down to a page multiple,
+    # floored at one page. <= 0 disables the feature entirely (stock
+    # behavior); it is also inert when chunked prefill is disabled or when
+    # no decode exists anywhere in the group.
+    SGLANG_DECODE_AWARE_CHUNK_SIZE = EnvInt(1024)
+    # Cold-giant admission control (OUR patch; see
+    # scheduler_components/cold_giant_admission.py). Knob A: a request
+    # whose REMAINING uncached input exceeds this many tokens is capped at
+    # this many fresh tokens per pass, regardless of group decode state --
+    # the decode-aware cap above only engages when a rank is decoding, so
+    # a cold giant arriving into a decode-idle gap would otherwise take
+    # full-size chunks (4096/rank on our box) back-to-back and stall the
+    # joint DP step. <= 0 disables (stock behavior): bit-for-bit unchanged
+    # until the operator turns the knob on. Working value used by the
+    # swap-in drill: 1024 (= the decode-aware level, so a giant's pass
+    # never exceeds the decode-coexistent size in ANY group state).
+    # Aligned down to a page multiple, floored at one page, like
+    # SGLANG_DECODE_AWARE_CHUNK_SIZE.
+    SGLANG_COLD_PREFILL_TOKEN_BUDGET = EnvInt(0)
+    # Knob B: cap the SUM of uncached prefill tokens prefilled across all
+    # DP ranks in one joint step, so N concurrently-prefilling cold giants
+    # cannot stack N x into the shared step. The per-rank signal rides the
+    # existing MLP-sync all-gather as a field addition (tp0_info column 7),
+    # never a new collective. Each rank shrinks its own pass chunk so
+    # (other ranks' last-gathered in-flight prefill + this rank's chunk)
+    # stays under this budget; floored at one page. <= 0 disables (stock
+    # behavior). Working value used by the swap-in drill: 16384 (=
+    # 4 x the 4096/rank base chunk: the stock fleet-worst-case SUM, an
+    # umbrella ceiling that bites when Knob A or the base chunk lets a
+    # single rank take more than a small slice of it).
+    SGLANG_CROSS_RANK_PREFILL_BUDGET = EnvInt(0)
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
     SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)

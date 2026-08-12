@@ -12,6 +12,12 @@ from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import world_dp_gather_enabled
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.scheduler_components.cold_giant_admission import (
+    record_gathered_uncached_extend,
+)
+from sglang.srt.managers.scheduler_components.decode_aware_chunking import (
+    record_gathered_forward_modes,
+)
 from sglang.srt.managers.scheduler_components.recv_skipper import (
     SchedulerRecvSkipper,
 )
@@ -89,6 +95,7 @@ class MLPSyncBatchInfo:
     is_extend_in_batch: bool
     local_can_run_tbo: bool
     local_forward_mode: int
+    local_uncached_extend_tokens: int
 
     # some gathered elements
     tp0_info: torch.Tensor = None
@@ -108,6 +115,7 @@ class MLPSyncBatchInfo:
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
                 int(self.can_run_prefill_cuda_graph),
+                self.local_uncached_extend_tokens,
             ],
             device=device,
             dtype=dtype,
@@ -123,6 +131,7 @@ class MLPSyncBatchInfo:
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # can_run_prefill_cuda_graph
+                0,  # local_uncached_extend_tokens
             ],
             device=device,
             dtype=dtype,
@@ -295,6 +304,23 @@ def prepare_mlp_sync_batch_raw(
     if local_batch is not None:
         local_batch.is_extend_in_batch = is_extend_in_batch
 
+    # Cold-giant admission (OUR patch): the number of UNCACHED prefill
+    # tokens this rank is extending this joint step. extend_num_tokens is
+    # 0 for decode/idle/prebuilt batches (it is only populated on extend-
+    # family batches at batch init), so this is 0 on any rank that is not
+    # prefilling. MIXED batches are excluded too: mix_with_running adds the
+    # running DECODE count into extend_num_tokens, so counting it would
+    # report decode tokens as prefill; on this deployment MIXED is
+    # unreachable anyway (hard-asserted off under spec decode), and
+    # reporting 0 under-bounds rather than over-counts. The signal rides
+    # the existing MLP-sync gather as a field addition (tp0_info column 7),
+    # never a new collective. See
+    # scheduler_components/cold_giant_admission.py.
+    if is_extend_in_batch and not local_batch.forward_mode.is_mixed():
+        local_uncached_extend_tokens = local_batch.extend_num_tokens
+    else:
+        local_uncached_extend_tokens = 0
+
     tbo_preparer = TboDPAttentionPreparer()
     use_world_group = world_dp_gather_enabled()
     if use_world_group:
@@ -333,6 +359,7 @@ def prepare_mlp_sync_batch_raw(
         is_extend_in_batch=is_extend_in_batch,
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
+        local_uncached_extend_tokens=local_uncached_extend_tokens,
     )
 
     if not skip_all_gather:
@@ -368,14 +395,31 @@ def prepare_mlp_sync_batch_raw(
             batch_to_gather, mlp_sync_info, require_mlp_tp_gather, skip_all_gather
         )
 
-    # Set on `local_batch`, not `batch_to_gather`: for PREBUILT batches the
-    # scheduler's `last_batch` is the prebuilt batch, not its inner idle batch.
-    if local_batch is not None and not skip_all_gather:
-        local_batch.recv_skipper_forward_mode = (
-            SchedulerRecvSkipper.derive_forward_mode(
-                mlp_sync_info.tp0_info[:, 5].tolist()
+    if not skip_all_gather:
+        # Per-DP-rank forward modes from this step's gather (one 7-int-per-
+        # rank D2H, same tensor the recv skipper already copies below).
+        # Recorded even when local_batch is None (fully idle group) so the
+        # decode-aware chunk cap sees decode DISAPPEAR, not only appear:
+        # otherwise a giant prefill arriving after an idle stretch would be
+        # taxed by a stale decode-present flag. Consumed at the NEXT
+        # iteration's batch formation (see decode_aware_chunking.py for the
+        # one-step-staleness rationale).
+        gathered_forward_modes = mlp_sync_info.tp0_info[:, 5].tolist()
+        record_gathered_forward_modes(gathered_forward_modes)
+
+        # Same staleness/clearing rule, same gather: per-DP-rank uncached
+        # prefill tokens of this step (column 7, the field addition for
+        # cold-giant admission Knob B). Recorded on every gather including
+        # fully-idle ones so the cross-rank SUM can clear.
+        gathered_uncached_extend = mlp_sync_info.tp0_info[:, 7].tolist()
+        record_gathered_uncached_extend(gathered_uncached_extend)
+
+        # Set on `local_batch`, not `batch_to_gather`: for PREBUILT batches the
+        # scheduler's `last_batch` is the prebuilt batch, not its inner idle batch.
+        if local_batch is not None:
+            local_batch.recv_skipper_forward_mode = (
+                SchedulerRecvSkipper.derive_forward_mode(gathered_forward_modes)
             )
-        )
 
     if _ENABLE_METRICS_DP_ATTENTION and local_batch is not None:
         local_batch.dp_cooperation_info = mlp_sync_info.dp_cooperation_info

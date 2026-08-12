@@ -200,6 +200,16 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.managers.scheduler_components.cold_giant_admission import (
+    cap_cross_rank_chunk,
+    cold_prefill_token_budget,
+    cross_rank_prefill_budget,
+    cross_rank_uncached_sum_excluding,
+)
+from sglang.srt.managers.scheduler_components.decode_aware_chunking import (
+    decode_aware_chunk_size,
+    maybe_cap_chunk_size,
+)
 from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
@@ -1155,6 +1165,39 @@ class Scheduler(
         self._pending_chunked_abort_req = None
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
+        )
+
+        # Decode-aware adaptive prefill chunking (OUR patch; full rationale
+        # in scheduler_components/decode_aware_chunking.py). Inert when
+        # chunked prefill is disabled: the cap only shrinks existing chunk
+        # budgets, it never introduces chunking the operator turned off.
+        self.decode_aware_chunk_size = (
+            decode_aware_chunk_size(self.page_size)
+            if self.chunked_prefill_size is not None
+            else None
+        )
+
+        # Cold-giant admission budgets (OUR patch; full rationale in
+        # scheduler_components/cold_giant_admission.py): Knob A caps a
+        # cold giant's per-pass fresh-token intake in the PrefillAdder
+        # (request-shape-keyed, always binding for giants -- including the
+        # decode-idle gap the decode-aware cap deliberately leaves alone);
+        # Knob B caps the cross-rank SUM via the existing MLP-sync gather
+        # (field-addition signal, no new collective). Both are chunk-
+        # budget reducers like the decode-aware cap: inert when chunked
+        # prefill itself is disabled, and <=0 envs disable each
+        # independently (None = stock behavior).
+        self.cold_prefill_token_budget = (
+            cold_prefill_token_budget(
+                envs.SGLANG_COLD_PREFILL_TOKEN_BUDGET.get(), self.page_size
+            )
+            if self.chunked_prefill_size is not None
+            else None
+        )
+        self.cross_rank_prefill_budget = (
+            cross_rank_prefill_budget(envs.SGLANG_CROSS_RANK_PREFILL_BUDGET.get())
+            if self.chunked_prefill_size is not None
+            else None
         )
 
         # Init the dynamic chunking predictor for PP
@@ -3155,6 +3198,38 @@ class Scheduler(
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
 
+        # Decode-aware cap (OUR patch): if any DP rank had decode work in
+        # the last MLP-sync gather (or this rank has running decodes right
+        # now), shrink this pass's chunk budget so the joint DP-attention
+        # step stays short and co-running decodes keep stepping. Applied
+        # after PP dynamic chunking via min() so both bounds hold. See
+        # scheduler_components/decode_aware_chunking.py for the rationale,
+        # the one-iteration signal staleness, and the tradeoff.
+        chunked_prefill_size = maybe_cap_chunk_size(
+            chunked_prefill_size,
+            self.decode_aware_chunk_size,
+            0 if running_batch.is_prefill_only else len(running_batch.reqs),
+        )
+
+        # Cold-giant admission Knob B (OUR patch): cap the cross-rank SUM
+        # of uncached prefill tokens in this joint step. other ranks'
+        # in-flight uncached prefill totals come from the previous
+        # MLP-sync gather (same one-step-staleness contract as the
+        # decode-aware cap; column 7 field addition, no new collective).
+        # Shrinks THIS rank's pass chunk so (others' sum + my chunk) stays
+        # under SGLANG_CROSS_RANK_PREFILL_BUDGET; see
+        # scheduler_components/cold_giant_admission.py. Knob A (per-
+        # request) is applied inside the PrefillAdder below, where the
+        # per-request remaining-uncached is already computed.
+        chunked_prefill_size = cap_cross_rank_chunk(
+            chunked_prefill_size,
+            self.cross_rank_prefill_budget,
+            cross_rank_uncached_sum_excluding(
+                self.ps.dp_rank if self.ps.dp_rank is not None else 0
+            ),
+            self.page_size,
+        )
+
         # Prefill policy
         adder = PrefillAdder(
             self.page_size,
@@ -3172,6 +3247,7 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
+            cold_prefill_token_budget=self.cold_prefill_token_budget,
         )
 
         if self.chunked_req is not None:

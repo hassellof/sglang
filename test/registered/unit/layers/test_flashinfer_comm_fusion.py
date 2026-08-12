@@ -24,6 +24,7 @@ class _FakeWorkspace:
 
 class _FakeFlashInferComm:
     class AllReduceFusionPattern:
+        kAllReduce = object()
         kARResidualRMSNorm = object()
 
     def __init__(self):
@@ -38,13 +39,20 @@ class _FakeFlashInferComm:
         *,
         input,
         workspace,
-        residual_out,
-        norm_out,
-        residual_in,
-        rms_gamma,
-        rms_eps,
+        pattern,
+        residual_out=None,
+        norm_out=None,
+        residual_in=None,
+        rms_gamma=None,
+        rms_eps=None,
         **_kwargs,
     ):
+        if pattern is self.AllReduceFusionPattern.kAllReduce:
+            return input * workspace.world_size
+
+        if pattern is not self.AllReduceFusionPattern.kARResidualRMSNorm:
+            raise ValueError(f"Unexpected pattern: {pattern}")
+
         allreduced = input * workspace.world_size
         expected_residual = allreduced + residual_in
         variance = expected_residual.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
@@ -72,6 +80,73 @@ def _torch_allreduce_residual_rmsnorm_baseline(
 
 
 class TestFlashInferCommFusion(unittest.TestCase):
+    def test_trtllm_workspace_preflight_does_not_require_multicast(self):
+        class _FakeCudaDriver:
+            CUresult = types.SimpleNamespace(CUDA_SUCCESS=0)
+            CUmemAllocationGranularity_flags = types.SimpleNamespace(
+                CU_MEM_ALLOC_GRANULARITY_RECOMMENDED=0
+            )
+
+            @staticmethod
+            def cuMemGetAllocationGranularity(_prop, _flag):
+                return 0, 65536
+
+            @staticmethod
+            def cuMulticastGetGranularity(*_args):
+                raise AssertionError("TRT-LLM symmetric memory has multicast disabled")
+
+        sizes = fusion._flashinfer_trtllm_workspace_allocation_sizes(
+            _FakeCudaDriver(),
+            object(),
+            world_size=2,
+            max_token_num=32,
+            hidden_dim=16,
+            dtype=torch.bfloat16,
+        )
+        self.assertEqual(sizes, [2162688, 2162688, 2162688])
+
+    def test_mnnvl_workspace_preflight_keeps_multicast_granularity(self):
+        multicast_queries = []
+
+        class _FakeMulticastProp:
+            numDevices = None
+            size = None
+            handleTypes = None
+
+        class _FakeCudaDriver:
+            CUresult = types.SimpleNamespace(CUDA_SUCCESS=0)
+            CUmemAllocationGranularity_flags = types.SimpleNamespace(
+                CU_MEM_ALLOC_GRANULARITY_RECOMMENDED=0
+            )
+            CUmulticastGranularity_flags = types.SimpleNamespace(
+                CU_MULTICAST_GRANULARITY_RECOMMENDED=0
+            )
+            CUmulticastObjectProp = _FakeMulticastProp
+
+            @staticmethod
+            def cuMemGetAllocationGranularity(_prop, _flag):
+                return 0, 65536
+
+            @staticmethod
+            def cuMulticastGetGranularity(mc_prop, _flag):
+                multicast_queries.append(mc_prop.size)
+                return 0, 1 << 25
+
+        prop = types.SimpleNamespace(requestedHandleTypes=object())
+        sizes = fusion._flashinfer_trtllm_workspace_allocation_sizes(
+            _FakeCudaDriver(),
+            prop,
+            world_size=2,
+            max_token_num=32,
+            hidden_dim=16,
+            dtype=torch.bfloat16,
+            align_multicast=True,
+        )
+        # McastGPUBuffer rounds each allocation up to the multicast
+        # granularity (32 MiB here), on top of the allocation granularity.
+        self.assertEqual(sizes, [1 << 25, 1 << 25, 1 << 25])
+        self.assertEqual(multicast_queries, [2162688, 2162688, 2162688])
+
     def test_auto_backend_resolves_by_arch(self):
         single_node = types.SimpleNamespace(
             flashinfer_allreduce_fusion_backend="auto", nnodes=1
@@ -81,7 +156,10 @@ class TestFlashInferCommFusion(unittest.TestCase):
         )
 
         # Blackwell: mnnvl on both single-node and multi-node.
-        with patch.object(fusion, "is_sm100_supported", return_value=True):
+        with (
+            patch.object(fusion, "is_sm100_supported", return_value=True),
+            patch.object(fusion, "is_sm120_supported", return_value=False),
+        ):
             self.assertEqual(
                 fusion.resolve_flashinfer_allreduce_fusion_backend(single_node),
                 "mnnvl",
@@ -94,6 +172,7 @@ class TestFlashInferCommFusion(unittest.TestCase):
         with (
             patch.object(fusion, "is_sm100_supported", return_value=False),
             patch.object(fusion, "is_sm90_supported", return_value=True),
+            patch.object(fusion, "is_sm120_supported", return_value=False),
         ):
             self.assertEqual(
                 fusion.resolve_flashinfer_allreduce_fusion_backend(single_node),
@@ -102,13 +181,27 @@ class TestFlashInferCommFusion(unittest.TestCase):
             with self.assertRaises(ValueError):
                 fusion.resolve_flashinfer_allreduce_fusion_backend(multi_node)
 
-        # Architectures outside SM90/SM10X are unsupported. Both pre-SM90
-        # and post-SM10X devices (e.g. SM120) must fail closed.
-        for arch in ("pre_sm90", "post_sm10x"):
+        # SM12X (SM120/SM121): auto uses trtllm on single-node, multi-node is
+        # unsupported.
+        with (
+            patch.object(fusion, "is_sm100_supported", return_value=False),
+            patch.object(fusion, "is_sm90_supported", return_value=False),
+            patch.object(fusion, "is_sm120_supported", return_value=True),
+        ):
+            self.assertEqual(
+                fusion.resolve_flashinfer_allreduce_fusion_backend(single_node),
+                "trtllm",
+            )
+            with self.assertRaises(ValueError):
+                fusion.resolve_flashinfer_allreduce_fusion_backend(multi_node)
+
+        # Architectures outside SM90/SM10X/SM12X (SM120/SM121) are unsupported.
+        for arch in ("pre_sm90", "post_sm120"):
             with (
                 self.subTest(arch=arch),
                 patch.object(fusion, "is_sm100_supported", return_value=False),
                 patch.object(fusion, "is_sm90_supported", return_value=False),
+                patch.object(fusion, "is_sm120_supported", return_value=False),
             ):
                 with self.assertRaises(ValueError):
                     fusion.resolve_flashinfer_allreduce_fusion_backend(single_node)
@@ -132,6 +225,7 @@ class TestFlashInferCommFusion(unittest.TestCase):
         with (
             patch.object(fusion, "is_sm100_supported", return_value=False),
             patch.object(fusion, "is_sm90_supported", return_value=True),
+            patch.object(fusion, "is_sm120_supported", return_value=False),
         ):
             self.assertEqual(
                 fusion.resolve_flashinfer_allreduce_fusion_backend(single_node_mnnvl),
@@ -146,7 +240,10 @@ class TestFlashInferCommFusion(unittest.TestCase):
             with self.assertRaises(ValueError):
                 fusion.resolve_flashinfer_allreduce_fusion_backend(multi_node_trtllm)
 
-        with patch.object(fusion, "is_sm100_supported", return_value=True):
+        with (
+            patch.object(fusion, "is_sm100_supported", return_value=True),
+            patch.object(fusion, "is_sm120_supported", return_value=False),
+        ):
             self.assertEqual(
                 fusion.resolve_flashinfer_allreduce_fusion_backend(multi_node_mnnvl),
                 "mnnvl",
@@ -154,11 +251,24 @@ class TestFlashInferCommFusion(unittest.TestCase):
             with self.assertRaises(ValueError):
                 fusion.resolve_flashinfer_allreduce_fusion_backend(multi_node_trtllm)
 
-        for arch in ("pre_sm90", "post_sm10x"):
+        with (
+            patch.object(fusion, "is_sm100_supported", return_value=False),
+            patch.object(fusion, "is_sm90_supported", return_value=False),
+            patch.object(fusion, "is_sm120_supported", return_value=True),
+        ):
+            self.assertEqual(
+                fusion.resolve_flashinfer_allreduce_fusion_backend(single_node_trtllm),
+                "trtllm",
+            )
+            with self.assertRaises(ValueError):
+                fusion.resolve_flashinfer_allreduce_fusion_backend(single_node_mnnvl)
+
+        for arch in ("pre_sm90", "post_sm120"):
             with (
                 self.subTest(arch=arch),
                 patch.object(fusion, "is_sm100_supported", return_value=False),
                 patch.object(fusion, "is_sm90_supported", return_value=False),
+                patch.object(fusion, "is_sm120_supported", return_value=False),
             ):
                 for args in (
                     single_node_mnnvl,
@@ -238,6 +348,159 @@ class TestFlashInferCommFusion(unittest.TestCase):
             else:
                 buffers[manager_key] = original_manager
             fusion._flashinfer_allreduce_unavailable = original_unavailable
+
+
+class TestFlashInferAllReduceOnly(unittest.TestCase):
+    def _make_manager(self, world_size):
+        manager = fusion.FlashInferWorkspaceManager()
+        manager.workspace = _FakeWorkspace(None, world_size)
+        manager.initialized = True
+        manager.max_token_num = 2048
+        manager.hidden_dim = 4096
+        return manager
+
+    def _set_attn_workspace_manager(self, manager):
+        from sglang.srt.runtime_context import get_resources
+
+        buffers = get_resources().buffers
+        manager_key = "flashinfer_fusion_attn_tp_workspace"
+        original_manager = buffers.get(manager_key)
+        buffers[manager_key] = manager
+        return buffers, manager_key, original_manager
+
+    def _restore_attn_workspace_manager(
+        self, buffers, manager_key, original_manager
+    ):
+        if original_manager is None:
+            buffers.pop(manager_key, None)
+        else:
+            buffers[manager_key] = original_manager
+
+    def test_allreduce_output_equals_input_times_world_size(self):
+        world_size = 4
+        fake_comm = _FakeFlashInferComm()
+        manager = self._make_manager(world_size)
+
+        original_comm = fusion._flashinfer_comm
+        original_unavailable = fusion._flashinfer_allreduce_unavailable
+        buffers, manager_key, original_manager = self._set_attn_workspace_manager(
+            manager
+        )
+        try:
+            fusion._flashinfer_comm = fake_comm
+            fusion._flashinfer_allreduce_unavailable = False
+
+            if not torch.cuda.is_available():
+                self.skipTest("CUDA required for flashinfer custom op")
+            device = torch.device("cuda")
+            input_ = torch.randn(8, 16, dtype=torch.bfloat16, device=device)
+            expected = input_ * world_size
+
+            with get_parallel().override(attn_tp_size=world_size):
+                result = fusion.flashinfer_allreduce(input_, use_attn_tp_group=True)
+
+            self.assertIsNotNone(result)
+            torch.testing.assert_close(result, expected)
+        finally:
+            fusion._flashinfer_comm = original_comm
+            fusion._flashinfer_allreduce_unavailable = original_unavailable
+            self._restore_attn_workspace_manager(
+                buffers, manager_key, original_manager
+            )
+
+    def test_shape_guard_returns_none_for_non_2d(self):
+        world_size = 4
+        fake_comm = _FakeFlashInferComm()
+        manager = self._make_manager(world_size)
+
+        original_comm = fusion._flashinfer_comm
+        original_unavailable = fusion._flashinfer_allreduce_unavailable
+        buffers, manager_key, original_manager = self._set_attn_workspace_manager(
+            manager
+        )
+        try:
+            fusion._flashinfer_comm = fake_comm
+            fusion._flashinfer_allreduce_unavailable = False
+
+            input_1d = torch.randn(16)
+            input_3d = torch.randn(2, 8, 16)
+
+            self.assertIsNone(
+                fusion.flashinfer_allreduce(input_1d, use_attn_tp_group=True)
+            )
+            self.assertIsNone(
+                fusion.flashinfer_allreduce(input_3d, use_attn_tp_group=True)
+            )
+        finally:
+            fusion._flashinfer_comm = original_comm
+            fusion._flashinfer_allreduce_unavailable = original_unavailable
+            self._restore_attn_workspace_manager(
+                buffers, manager_key, original_manager
+            )
+
+    def test_shape_guard_returns_none_for_non_contiguous(self):
+        world_size = 4
+        fake_comm = _FakeFlashInferComm()
+        manager = self._make_manager(world_size)
+
+        original_comm = fusion._flashinfer_comm
+        original_unavailable = fusion._flashinfer_allreduce_unavailable
+        buffers, manager_key, original_manager = self._set_attn_workspace_manager(
+            manager
+        )
+        try:
+            fusion._flashinfer_comm = fake_comm
+            fusion._flashinfer_allreduce_unavailable = False
+
+            base = torch.randn(16, 8)
+            non_contiguous = base.t()
+            self.assertFalse(non_contiguous.is_contiguous())
+
+            self.assertIsNone(
+                fusion.flashinfer_allreduce(non_contiguous, use_attn_tp_group=True)
+            )
+        finally:
+            fusion._flashinfer_comm = original_comm
+            fusion._flashinfer_allreduce_unavailable = original_unavailable
+            self._restore_attn_workspace_manager(
+                buffers, manager_key, original_manager
+            )
+
+    def test_returns_none_when_unavailable(self):
+        original_unavailable = fusion._flashinfer_allreduce_unavailable
+        try:
+            fusion._flashinfer_allreduce_unavailable = True
+            input_ = torch.randn(8, 16)
+            self.assertIsNone(
+                fusion.flashinfer_allreduce(input_, use_attn_tp_group=True)
+            )
+        finally:
+            fusion._flashinfer_allreduce_unavailable = original_unavailable
+
+    def test_returns_none_when_workspace_uninitialized(self):
+        world_size = 4
+        fake_comm = _FakeFlashInferComm()
+        manager = fusion.FlashInferWorkspaceManager()
+
+        original_comm = fusion._flashinfer_comm
+        original_unavailable = fusion._flashinfer_allreduce_unavailable
+        buffers, manager_key, original_manager = self._set_attn_workspace_manager(
+            manager
+        )
+        try:
+            fusion._flashinfer_comm = fake_comm
+            fusion._flashinfer_allreduce_unavailable = False
+
+            input_ = torch.randn(8, 16)
+            with get_parallel().override(attn_tp_size=world_size):
+                result = fusion.flashinfer_allreduce(input_, use_attn_tp_group=True)
+            self.assertIsNone(result)
+        finally:
+            fusion._flashinfer_comm = original_comm
+            fusion._flashinfer_allreduce_unavailable = original_unavailable
+            self._restore_attn_workspace_manager(
+                buffers, manager_key, original_manager
+            )
 
 
 if __name__ == "__main__":

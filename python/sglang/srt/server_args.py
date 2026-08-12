@@ -1043,10 +1043,38 @@ class ServerArgs:
                 "follow_bootstrap_room",
                 "total_requests",
                 "total_tokens",
+                "prefix_affinity",
             ],
         ),
         NS("parallel"),
     ] = "auto"
+    prefix_affinity_fallback: A[
+        str,
+        Arg(
+            help=(
+                "Load-balance method used by 'prefix_affinity' when it cannot honor "
+                "affinity (no routing key and token fallback disabled or unusable, "
+                "or all live ranks over the load-skew threshold)."
+            ),
+            choices=["round_robin", "total_requests", "total_tokens"],
+        ),
+    ] = "total_tokens"
+    prefix_affinity_max_load_skew: A[
+        float,
+        "For 'prefix_affinity': a rank is considered overloaded when its load exceeds "
+        "this multiple of the average load across live ranks, at which point routing "
+        "skips it to keep load balanced. Must be >= 1.0.",
+    ] = 1.5
+    prefix_affinity_hash_tokens: A[
+        int,
+        "For 'prefix_affinity': number of leading input tokens hashed for the "
+        "token-prefix fallback key when a request has no routing key.",
+    ] = 4096
+    prefix_affinity_disable_token_fallback: A[
+        bool,
+        "For 'prefix_affinity': disable the token-prefix fallback key so that requests "
+        "without an explicit routing key go straight to the fallback load-balance method.",
+    ] = False
     attn_cp_size: A[
         int,
         Arg(
@@ -1958,6 +1986,13 @@ class ServerArgs:
         "Inkling: replace the attention/MLP output all-reduce with a hidden-dimension reduce-scatter, run the channelwise output short convolution on the [T, H/P] shard, then all-gather before the residual add. This shards the convolution cache across tensor-parallel ranks without changing communication volume.",
         NS("exec.comm"),
     ] = False
+    enable_flashinfer_allreduce_only: A[
+        bool,
+        Arg(
+            help="Route allreduce-only tensor-parallel all-reduce through FlashInfer kAllReduce when the flashinfer allreduce workspace is already initialized (requires --flashinfer-allreduce-fusion-backend). Falls back to NCCL for non-2D tensors or when the workspace is unavailable.",
+            resolvable=True,
+        ),
+    ] = False
     pre_warm_nccl: A[
         bool,
         "Pre-warm NCCL/RCCL communicators during startup to reduce P99 TTFT cold-start latency. Default: enabled for AMD/HIP (RCCL), disabled for NVIDIA/CUDA (NCCL).",
@@ -1979,10 +2014,11 @@ class ServerArgs:
         Arg(
             help=(
                 "Enable FlashInfer allreduce fusion and choose backend. "
-                "Requires SM90 or SM10X NVIDIA GPUs. "
+                "Requires SM90, SM10X, or SM12X (SM120/SM121) NVIDIA GPUs. "
                 "Defaults to auto. "
                 "'auto': choose mnnvl on Blackwell (SM100/SM103) systems "
-                "(single- and multi-node) and trtllm on SM90 single-node systems. "
+                "(single- and multi-node) and trtllm on SM90, SM120, and SM121 "
+                "single-node systems. "
                 "'trtllm': available on single-node systems only. "
                 "'mnnvl': available on SM90 single-node systems and SM100/SM103 "
                 "single-node or multi-node systems via MNNVL fabric. "
@@ -3863,6 +3899,15 @@ class ServerArgs:
                 else "round_robin"
             )
             return
+
+        if (
+            self.load_balance_method == "prefix_affinity"
+            and self.prefix_affinity_max_load_skew < 1.0
+        ):
+            raise ValueError(
+                "--prefix-affinity-max-load-skew must be >= 1.0, got "
+                f"{self.prefix_affinity_max_load_skew}"
+            )
 
     def _handle_ssl_validation(self):
         """Ensure SSL arguments are consistent and referenced files exist."""
