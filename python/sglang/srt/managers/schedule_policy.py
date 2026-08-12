@@ -459,6 +459,7 @@ class PrefillAdder:
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
+        cold_prefill_token_budget: Optional[int] = None,
     ):
         self.page_size = page_size
         self.tree_cache = tree_cache
@@ -468,6 +469,13 @@ class PrefillAdder:
         self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.dllm_config = dllm_config
+        # Cold-giant admission Knob A (OUR patch; page-aligned, None when
+        # disabled): a request whose remaining uncached input exceeds the
+        # budget is capped at budget fresh tokens per pass -- in the
+        # PrefillAdder, where the per-request remaining-uncached figure is
+        # already computed. Chunk-budget reducer only, never an admission
+        # gate; see scheduler_components/cold_giant_admission.py.
+        self.cold_prefill_token_budget = cold_prefill_token_budget
 
         if self.dllm_config is not None:
             self._init_dllm_meta(dllm_config)
@@ -897,6 +905,18 @@ class PrefillAdder:
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
         )
+        # Cold-giant admission Knob A (OUR patch): a mid-drain chunked
+        # request whose remaining uncached input still exceeds the
+        # per-request budget keeps taking at most budget fresh tokens per
+        # pass, regardless of group decode state -- the decode-idle gap is
+        # exactly where the decode-aware cap (decode-presence keyed) is
+        # deliberately inert. min() with the existing pass budget; see
+        # scheduler_components/cold_giant_admission.py.
+        if (
+            self.cold_prefill_token_budget is not None
+            and cand_extend_input_len > self.cold_prefill_token_budget
+        ):
+            _rem_tokens = min(_rem_tokens, self.cold_prefill_token_budget)
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
@@ -1172,6 +1192,34 @@ class PrefillAdder:
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
             )
 
+            # Cold-giant admission Knob A (OUR patch): if this request's
+            # remaining uncached input exceeds the per-request budget AND it
+            # would take the chunked path anyway (input > this rank's chunk
+            # budget), cap its per-pass intake at the budget. The second
+            # condition is load-bearing for SAFETY: the budget must never
+            # turn a request stock would have prefilled in one pass
+            # (budget < input <= chunk limit) into a chunked request, or the
+            # knob enlarges the in-flight chunked-request class -- upstream
+            # supports only ONE chunked request per rank, and exactly that
+            # misclassification crashed the scheduler on fix30-pre
+            # (assert self.chunked_req is None, _get_new_batch_prefill_raw)
+            # under two concurrent >1024-token requests on one rank
+            # (2026-08-10 drill, A=1024 vs stock's >4096 chunkability).
+            # min() with this rank's chunk budget, applied last so it
+            # composes with the SWA cap above. Inert when chunked prefill is
+            # disabled (never introduces chunking the operator turned off --
+            # same principle as decode_aware_chunking) or when the budget is
+            # off. See scheduler_components/cold_giant_admission.py.
+            if (
+                self.cold_prefill_token_budget is not None
+                and chunk_tokens_limit is not None
+                and input_tokens > chunk_tokens_limit
+                and input_tokens > self.cold_prefill_token_budget
+            ):
+                chunk_tokens_limit = min(
+                    chunk_tokens_limit, self.cold_prefill_token_budget
+                )
+
             if (
                 self.rem_chunk_tokens is None
                 and len(self.can_run_list) != 0
@@ -1192,6 +1240,24 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
+            elif (
+                has_chunked_req
+                and chunk_tokens_limit is not None
+                and input_tokens > chunk_tokens_limit
+            ):
+                # One in-flight chunked prefill per rank: the queue-update
+                # below asserts `self.chunked_req is None` when a new chunked
+                # request appears, so admitting a second chunkable request
+                # while another chunk is in flight crashes the whole
+                # scheduler process group (upstream v0.5.16 latent crash,
+                # scheduler.py:3117 in _get_new_batch_prefill_raw; the
+                # has_chunked_req flag was threaded into add_one_req for
+                # exactly this defer but never used). Defer instead: this
+                # request waits in the queue and is admitted once the
+                # in-flight chunk finishes, at the cost of one drain of
+                # latency instead of a killpg. Discovered via the 2026-08-10
+                # cold-giant admission drill on sage.
+                return AddReqResult.OTHER
             elif chunk_tokens_limit is None or input_tokens <= chunk_tokens_limit:
                 # Non-chunked prefill — the whole sequence is committed this iter.
                 req.set_extend_range(

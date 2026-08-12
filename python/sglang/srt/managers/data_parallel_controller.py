@@ -14,11 +14,13 @@
 """A controller that dispatches requests to multiple data parallel workers."""
 
 import faulthandler
+import hashlib
 import logging
 import multiprocessing as mp
 import signal
 import threading
 import time
+from collections import OrderedDict
 from enum import Enum, auto
 from typing import Callable, List, Optional
 
@@ -83,6 +85,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    PREFIX_AFFINITY = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -160,11 +163,37 @@ class DataParallelController:
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.PREFIX_AFFINITY: self.prefix_affinity_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
             LoadBalanceMethod.TOTAL_REQUESTS,
             LoadBalanceMethod.TOTAL_TOKENS,
+            # PREFIX_AFFINITY's overload guard compares per-rank load against the
+            # fleet average, so it needs the same fresh snapshots the load-aware
+            # methods rely on.
+            LoadBalanceMethod.PREFIX_AFFINITY,
+        )
+
+        # prefix_affinity routing config (only consulted when that method is active).
+        self._affinity_fallback = LoadBalanceMethod.from_str(
+            server_args.prefix_affinity_fallback
+        )
+        self._affinity_max_load_skew = server_args.prefix_affinity_max_load_skew
+        self._affinity_hash_tokens = server_args.prefix_affinity_hash_tokens
+        self._affinity_disable_token_fallback = (
+            server_args.prefix_affinity_disable_token_fallback
+        )
+        # Stateful first-touch load-aware placement (see _affinity_home /
+        # _record_binding). ``None`` means disabled: placement stays the
+        # stateless HRW lookup, bit-identical to pre-first-touch behavior.
+        self._affinity_binding_capacity = max(
+            envs.SGLANG_PREFIX_AFFINITY_BINDING_CAPACITY.get(), 1
+        )
+        self._affinity_bindings: Optional[OrderedDict] = (
+            OrderedDict()
+            if envs.SGLANG_PREFIX_AFFINITY_FIRST_TOUCH_LB.get()
+            else None
         )
 
         self.launch_dp_size: int = server_args.dp_size
@@ -797,6 +826,303 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
         sock_send(self.workers[target_worker], req)
+
+    def prefix_affinity_scheduler(self, req: Req):
+        """Routing-key/session-affinity routing for single-instance DP attention.
+
+        Routes requests that share a routing key to the same DP rank so the radix
+        cache is reused, while a load guard prevents any one rank from becoming
+        a hotspot. The routing key is, in priority order:
+
+          1. ``req.routing_key`` (set by the caller, e.g. the ``x-smg-routing-key``
+             header) -- the intended per-agent/session/project affinity key.
+          2. a hash of the first N input tokens, as a fallback when no explicit
+             key is provided (disable-able via config).
+
+        Unlike a plain ``hash(key) % dp_size`` scheme, we use rendezvous (HRW)
+        hashing over the *live* ranks: when a rank drops or ``dp_size`` changes,
+        only the keys that mapped to the affected rank move, so everyone else
+        keeps their cache affinity. The load guard walks the HRW-ranked
+        candidates and picks the best rank that is not overloaded, preserving
+        affinity under load instead of collapsing onto a single rank.
+
+        A rank's own HRW-preferred (first-ranked) candidate is checked only
+        against the request-count guard, never against resident-token
+        footprint -- a key's own previously-cached prefix must never count
+        against its own continuation (see dsv4-prefix-affinity-skew-by-
+        requests.diff). Spillover candidates (rank 2nd-choice or later) are
+        additionally required to be memory-healthy: a different, unrelated
+        key that spills over should not land on a rank that's currently
+        holding someone else's large, valuable cache if a lighter rank is
+        available. This does not protect against two distinct keys whose
+        HRW top choice happens to coincide on the same rank -- that
+        collision is accepted as a rare, bounded-probability cost, same as
+        every rendezvous-hashing scheme; solving it fully would need
+        cross-rank cache-content visibility this controller doesn't have.
+
+        First placement is load-aware and sticky (first-touch LB,
+        ``SGLANG_PREFIX_AFFINITY_FIRST_TOUCH_LB``): a key with no binding
+        is placed on the least-loaded live rank instead of the raw HRW
+        winner -- turn 1 is the one moment placement is free, since there
+        is no cache to preserve yet -- and an in-controller LRU-bounded
+        binding table (see ``_record_binding``) keeps later turns on
+        whatever rank the key actually landed on, including after a guard
+        spillover diverts it. HRW remains the tiebreak among equally-loaded
+        ranks, the spillover candidate order, and the complete placement
+        story when the table is disabled.
+        """
+        if self.maybe_external_dp_rank_routing(req):
+            return
+
+        # ``routing_key`` is declared on TokenizedGenerateReqInput but not on
+        # TokenizedEmbeddingReqInput, which also reaches this scheduler via
+        # dispatching_with_trace. Use getattr so a request that doesn't carry
+        # the attribute falls through to the token/load fallback instead of
+        # raising AttributeError in the dispatcher.
+        route_key = getattr(req, "routing_key", None)
+        if not route_key and not self._affinity_disable_token_fallback:
+            route_key = self._token_prefix_key(req, self._affinity_hash_tokens)
+
+        if not route_key:
+            # No usable key (e.g. empty input and no routing_key): defer to a
+            # pure load-balancing method rather than pinning arbitrarily.
+            self._affinity_fallback_dispatch(req)
+            return
+
+        live = self._live_ranks()
+        ranked = self._rendezvous_ranked(route_key, live)
+
+        if len(live) <= 1:
+            # A single live rank can never be "overloaded" relative to itself.
+            # Still record the binding: when other ranks come back, the key's
+            # cache lives here and later turns must keep following it.
+            rank = ranked[0]
+            self._record_binding(route_key, rank)
+            self._increment_rank_budget(rank, req)
+            sock_send(self.workers[rank], req)
+            return
+
+        # The walk starts from the key's home rank (bound rank, or the
+        # least-loaded live rank on a first touch); the remaining candidates
+        # keep HRW order, exactly the pre-existing spillover semantics.
+        home, home_memory_exempt = self._affinity_home(route_key, live, ranked)
+        candidates = [home] + [r for r in ranked if r != home]
+
+        # Compute the overload ceiling once per dispatch rather than on every
+        # candidate: a rank is skipped if its load exceeds ``max_load_skew``
+        # times the live-rank average load.
+        loads = [self._rank_load(r) for r in live]
+        threshold = self._affinity_max_load_skew * max(sum(loads) / len(loads), 1.0)
+        mem_loads = [self._rank_memory_load(r) for r in live]
+        mem_threshold = self._affinity_max_load_skew * max(
+            sum(mem_loads) / len(mem_loads), 1.0
+        )
+        for i, rank in enumerate(candidates):
+            if self._rank_load(rank) > threshold:
+                continue
+            if (i > 0 or not home_memory_exempt) and (
+                self._rank_memory_load(rank) > mem_threshold
+            ):
+                # Spillover -- or a first touch, which by definition has no
+                # cache anywhere: don't dump a key with no cache here onto a
+                # rank that's memory-heavy from someone else's cache when a
+                # lighter live rank is still available. Only a rank holding
+                # this key's own cache is exempt (the fix21 lesson).
+                continue
+            self._record_binding(route_key, rank)
+            self._increment_rank_budget(rank, req)
+            sock_send(self.workers[rank], req)
+            return
+
+        # Every candidate failed a guard. Reachable: request count alone can
+        # never exclude the least-loaded rank (its load is <= the average),
+        # but the spillover memory ceiling can exclude everything when no
+        # rank is healthy on both axes at once. Dispatch via the fallback and
+        # FORGET the binding: the cache now grows wherever the fallback
+        # landed, which this scheduler cannot see -- re-placing the key fresh
+        # next turn is a one-time cache miss at worst, never a wrong pin.
+        self._drop_binding(route_key)
+        self._affinity_fallback_dispatch(req)
+
+    def _affinity_fallback_dispatch(self, req: Req):
+        """Dispatch via the configured load-aware fallback method.
+
+        Reuses the existing schedulers so budget accounting and status handling
+        stay identical to those methods.
+        """
+        if self._affinity_fallback == LoadBalanceMethod.TOTAL_REQUESTS:
+            self.total_requests_scheduler(req)
+        elif self._affinity_fallback == LoadBalanceMethod.ROUND_ROBIN:
+            self.round_robin_scheduler(req)
+        else:
+            self.total_tokens_scheduler(req)
+
+    def _affinity_home(self, key: str, live: List[int], ranked: List[int]):
+        """Rank the guarded dispatch walk starts from, for ``key``.
+
+        Returns ``(home, memory_exempt)``. ``memory_exempt`` says whether the
+        home rank skips the spillover memory ceiling: only a rank already
+        holding this key's own cache may ignore its resident-token footprint
+        -- a session must never be punished for its own cached prefix (the
+        dsv4-prefix-affinity-skew-by-requests.diff lesson) -- but a key with
+        no cache anywhere gets no such pass.
+
+        - Binding table disabled (``SGLANG_PREFIX_AFFINITY_FIRST_TOUCH_LB``
+          off): the HRW winner, memory-exempt -- bit-identical to the
+          stateless placement this feature replaces.
+        - Known key bound to a live rank: the bound rank, memory-exempt.
+        - New key, or bound rank no longer live (its KV cache died with it):
+          the least-loaded live rank. Turn 1 is the one moment placement is
+          free -- there is no cache to preserve -- so load-blind HRW is pure
+          waste there: it can land a brand-new giant session on a rank
+          mid-way through someone else's giant prefill while an idle rank
+          sits empty, and the skew guard only reacts once standing load
+          exceeds 1.5x the average, not to "an idle rank was available".
+          Primary signal is live request count (``_rank_load``:
+          running+waiting work from the ~20ms shm snapshots plus the
+          speculative dispatch increments -- the same admission-pressure
+          signal the skew guard and every surveyed affinity router key off);
+          resident-token footprint (``_rank_memory_load``) breaks ties so
+          admission evicts the least of other sessions' cache; HRW order
+          breaks any remaining tie, keeping idle-state placement
+          deterministic and identical to the stateless behavior.
+        """
+        bindings = self._affinity_bindings
+        if bindings is None:
+            return ranked[0], True
+        bound = bindings.get(key)
+        if bound is not None and bound in live:
+            return bound, True
+        hrw_pos = {rank: i for i, rank in enumerate(ranked)}
+        home = min(
+            live,
+            key=lambda r: (
+                self._rank_load(r),
+                self._rank_memory_load(r),
+                hrw_pos[r],
+            ),
+        )
+        return home, False
+
+    def _record_binding(self, key: str, rank: int):
+        """Bind ``key`` -> ``rank`` (LRU-bounded), refreshing recency.
+
+        prefix_affinity is otherwise stateless: without this table, a first
+        touch placed anywhere but the HRW winner would be lost by turn 2 --
+        the hash lookup goes back to the HRW rank and misses the cache.
+        Recording where the request ACTUALLY landed also repairs the
+        spillover case: once the overload guard diverts a turn, the cache
+        grows on the new rank, so later turns must follow it there.
+
+        A plain OrderedDict needs no locking: the dispatch path runs
+        single-threaded in the controller process (every dispatcher entry is
+        invoked synchronously from ``event_loop``; the launch/port-serving/
+        watchdog threads never dispatch -- verified on v0.5.16), which also
+        serializes two turns racing for an unbound key. The table dies with
+        the process, which is correct: the KV caches its entries point at
+        die with the process too. Every keyed dispatch refreshes its entry,
+        so capacity eviction (LRU ``popitem``) only reaches keys idle longer
+        than the newest ``capacity`` sessions; an evicted key silently
+        degrades to a fresh first touch on its next turn -- a one-time cache
+        miss at worst, never a routing error.
+        """
+        bindings = self._affinity_bindings
+        if bindings is None:
+            return
+        bindings[key] = rank
+        bindings.move_to_end(key)
+        while len(bindings) > self._affinity_binding_capacity:
+            bindings.popitem(last=False)
+
+    def _drop_binding(self, key: str):
+        if self._affinity_bindings is not None:
+            self._affinity_bindings.pop(key, None)
+
+    def _live_ranks(self) -> List[int]:
+        """Ranks currently marked active; fall back to all ranks if none are."""
+        ranks = [i for i in range(len(self.workers)) if self.status[i]]
+        return ranks or list(range(len(self.workers)))
+
+    @staticmethod
+    def _hash64(data: bytes) -> int:
+        return int.from_bytes(hashlib.blake2b(data, digest_size=8).digest(), "little")
+
+    def _rendezvous_ranked(self, key: str, ranks: List[int]) -> List[int]:
+        """Rendezvous (HRW) order of ``ranks`` for ``key``, best score first."""
+        key_b = key.encode("utf-8", errors="surrogatepass")
+        scores = {
+            rank: self._hash64(key_b + b"\x00" + str(rank).encode("ascii"))
+            for rank in ranks
+        }
+        return sorted(ranks, key=scores.__getitem__, reverse=True)
+
+    @staticmethod
+    def _token_prefix_key(req: Req, prefix_len: int) -> Optional[str]:
+        """Stable key from the first ``prefix_len`` input tokens (or None)."""
+        if prefix_len <= 0:
+            return None
+        input_ids = getattr(req, "input_ids", None)
+        if input_ids is None or len(input_ids) == 0:
+            return None
+        h = hashlib.blake2b(digest_size=16)
+        sliced = input_ids[:prefix_len]
+        tobytes = getattr(sliced, "tobytes", None)
+        if callable(tobytes):
+            # Fast path for array-like input_ids (e.g. numpy arrays): hash the
+            # raw buffer in one shot instead of per-token int conversions.
+            h.update(tobytes())
+        else:
+            for token in sliced:
+                h.update(int(token).to_bytes(8, "little", signed=True))
+        return "token-prefix:" + h.hexdigest()
+
+    @staticmethod
+    def _estimated_tokens(req: Req) -> int:
+        input_ids = getattr(req, "input_ids", None)
+        return 0 if input_ids is None else len(input_ids)
+
+    def _increment_rank_budget(self, rank: int, req: Req):
+        """Speculatively record the dispatch, mirroring ``DPBudget.dispatch``.
+
+        The affinity scheduler picks the rank itself instead of going through
+        ``DPBudget.dispatch``, so it must apply the same +1 request / +tokens
+        increment to keep the load estimate accurate between snapshot refreshes.
+        """
+        self.dp_budget.total_requests[rank] += 1
+        self.dp_budget.total_tokens[rank] += self._estimated_tokens(req)
+
+    def _rank_load(self, rank: int) -> float:
+        """Overload signal for the affinity skew guard: live running+waiting
+        request count, not resident KV-cache tokens.
+
+        A rank holding one huge, steadily-decoding long-context session reads
+        as many times the fleet-average token footprint despite having full
+        compute/memory headroom to serve more -- exactly the affinity-pinned
+        session the guard exists to protect, punished for being expensive to
+        reprefill. Every surveyed system that combines cache-affinity routing
+        with overload protection (sglang's own sgl-router cache-aware policy,
+        AIBrix, llm-d, Ray Serve's PrefixCacheAffinityRouter, Mooncake) keys
+        the skew/imbalance check off request or queue count and treats memory
+        occupancy as a separate admission ceiling for new, uncached requests
+        -- never as a reason to reroute an existing pinned continuation.
+        Decoupled from `_affinity_fallback` (that flag controls what to do
+        when affinity gives up, not what "overloaded" means).
+        """
+        return float(self.dp_budget.total_requests[rank])
+
+    def _rank_memory_load(self, rank: int) -> float:
+        """Resident-token footprint, for spillover-candidate selection only.
+
+        `_rank_load` deliberately never reads this for a key's own
+        HRW-preferred rank (see `prefix_affinity_scheduler`) -- this exists
+        so that when a *different* key spills over past its preferred
+        rank, it can still avoid dumping onto a rank that's currently
+        holding someone else's large, valuable-to-keep cache, given a
+        lighter live rank is available. Reuses `dp_budget.total_tokens`,
+        already tracked for the pre-existing `total_tokens` fallback
+        method -- no new instrumentation.
+        """
+        return float(self.dp_budget.total_tokens[rank])
 
     def event_loop(self):
         while True:
