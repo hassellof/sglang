@@ -829,31 +829,31 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 comp.refresh_lru(LRURefreshPhase.WALKDOWN, node, self.root_node)
 
     def _maybe_write_backup(
-        self, node: UnifiedTreeNode, chunked: bool = False
+        self, node: UnifiedTreeNode, chunked: bool = False, count: bool = True
     ) -> bool:
-        """Run the HiCache write-through backup check WITHOUT counting a reuse.
+        """Count a reuse and run the HiCache write-through backup check.
 
-        Upstream conflates two unrelated jobs in `_inc_hit_count_and_check`:
-        reuse accounting for the hit_count-based eviction policies, and the
-        write-through trigger that populates the host (L2) tier. Moving the
-        reuse accounting to the admission-path match walk (see match_prefix)
-        is correct for slru ordering, but it must not take the L2 write with
-        it: under `--hicache-write-policy write_through`
-        (write_through_threshold == 1) the INSERT walk is the only thing that
-        ever pushes a freshly built chain to the host tier. Without this the
-        policy silently degrades to write-on-first-reuse, and a chain whose
-        SWA is tombstoned by other requests' pool churn before it is ever
-        reused has no host copy to restore from - the exact retention failure
-        HiCache is being enabled to fix.
+        Upstream's `_inc_hit_count_and_check` both counts the insert-walk reuse
+        (every node the walk crosses) and fires the L2 write-through trigger on
+        the same pass. Our SLRU split pulled reuse accounting into the
+        admission match walk (`_inc_hit_count`) for slru ordering, but that
+        left the INSERT walk with a count-free write-through check — so
+        `write_through_selective` (threshold >= 2) could never fire for a chain
+        reached only by inserts. Restore the count here so the insert path
+        behaves like upstream: a node crossed by a fresh insert is a reuse and
+        counts toward the write-through threshold.
 
-        `chunked` preserves the stock guard: intermediate prefill chunks do
-        not trigger a backup; the final (unguarded) chunk's insert walk
-        descends the whole chain and backs up every node on it.
+        `count=False` is used for the terminal new leaf: `_add_new_node` sets
+        `hit_count = 1` (creation is the first hit), so counting again here
+        would double-count and back up a fresh leaf on its own creation at
+        threshold 2.
         """
         if node.evicted or chunked:
             return False
         if self.is_write_back:
             return False
+        if count:
+            node.hit_count += 1
         return (
             self.enable_hicache
             and not node.backuped
@@ -1073,9 +1073,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     LRURefreshPhase.INSERT_END, state.target_node, self.root_node
                 )
 
-        # The new leaf ends the chain.
+        # The new leaf ends the chain. Its creation already counted as a hit
+        # (hit_count=1), so don't re-count; just run the write-through check.
         if state.is_new_leaf and self._maybe_write_backup(
-            state.target_node, state.params.chunked
+            state.target_node, state.params.chunked, count=False
         ):
             state.pending_actions.append(
                 self._build_backup_kv_action(state.target_node, tail_distance=0)
