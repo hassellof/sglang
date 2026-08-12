@@ -4,6 +4,8 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_compress_state_ring_size,
     get_compress_state_write_pad,
 )
+from sglang.srt.runtime_context import get_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -16,6 +18,15 @@ class TestCompressStateWritePad(CustomTestCase):
     Mirrors `mtp_pad` in `c_plan.cuh`; `DSV4PoolConfigurator` rejects a larger draft
     count at startup.
     """
+
+    def setUp(self):
+        # get_compress_state_ring_size(..., is_speculative=True) reads
+        # speculative_num_draft_tokens from the process-wide ServerArgs. Publish a
+        # deterministic small budget (ndt=4 -> cr4 ring=16, pad=10) so the test is
+        # self-contained instead of depending on a leftover global context.
+        get_context().set_server_args(
+            ServerArgs(model_path="dummy", speculative_num_draft_tokens=4)
+        )
 
     def test_pad_is_zero_without_speculation(self):
         """A non-speculative ring is exactly one window wide: nothing rolls back."""
