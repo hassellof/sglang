@@ -2013,6 +2013,9 @@ class ServerArgs:
     enable_flashinfer_allreduce_fusion: A[bool, Arg(no_cli=True), NS("exec.comm")] = (
         False
     )
+    enable_flashinfer_allreduce_only: A[bool, Arg(no_cli=True), NS("exec.comm")] = (
+        False
+    )
     enforce_disable_flashinfer_allreduce_fusion: A[
         bool, "Enforce disable FlashInfer allreduce fusion.", NS("exec.comm")
     ] = False
